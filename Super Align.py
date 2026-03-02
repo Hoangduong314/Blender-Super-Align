@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Super Quick Align Pro",
     "author": "Bạn và AI",
-    "version": (1, 0, 0),
-    "blender": (4, 0, 0), # Tương thích tốt với Blender 4.x và 5.x
+    "version": (1, 1, 0),
+    "blender": (4, 0, 0), 
     "location": "View3D > Right Click Context Menu",
-    "description": "Căn gióng, giãn cách, bắt điểm thông minh và Copy vật thể siêu tốc",
+    "description": "Căn gióng (Min/Center/Max), giãn cách, bắt điểm thông minh và Copy siêu tốc",
     "warning": "",
     "doc_url": "",
     "category": "Object",
@@ -53,6 +53,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         self.selected_objs = [obj for obj in context.selected_objects if obj != self.active_obj]
         
         self.hovered_axis = None 
+        self.hovered_align_mode = 'CENTER' # THÊM: Biến lưu trạng thái Align (MIN, CENTER, MAX)
         
         self.snap_target = None 
         self.snap_normal = Vector((0,0,1))
@@ -150,7 +151,11 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             self.is_ctrl_pressed = event.ctrl 
             
             if event.shift or event.alt:
-                self.hovered_axis = self.get_hovered_axis(context)
+                # NHẬN QUYẾT ĐỊNH ALIGN MIN HAY MAX
+                h_axis, h_mode = self.get_hovered_axis(context)
+                self.hovered_axis = h_axis
+                self.hovered_align_mode = h_mode
+                
                 self.snap_target = None
                 self.draw_highlight_verts.clear()
             else:
@@ -168,7 +173,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                         self.report({'WARNING'}, "Cần chọn ít nhất 2 vật thể để Align!")
                     else:
                         self.align_objects(self.hovered_axis)
-                        bpy.ops.ed.undo_push(message="Align objects to center")
+                        bpy.ops.ed.undo_push(message=f"Align objects to {self.hovered_align_mode}")
                     return {'RUNNING_MODAL'}
                         
                 elif event.alt and self.hovered_axis is not None:
@@ -224,7 +229,6 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                             bbox_corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
                             distances = [(corner - self.snap_target).dot(self.snap_normal) for corner in bbox_corners]
                             min_dist = min(distances)
-                            
                             target_objs[i].location -= (self.snap_normal * min_dist)
                             
                         bpy.ops.ed.undo_push(message="Copy & Stamp to Plane" if event.ctrl else "Project Objects to Plane")
@@ -233,10 +237,8 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                         for i, obj in enumerate(all_objs):
                             bbox_corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
                             center_pt = sum(bbox_corners, Vector((0,0,0))) / 8.0
-                            
                             vec_center_to_midpoint = self.snap_target - center_pt
                             translation_vec = vec_center_to_midpoint.dot(self.snap_edge_dir) * self.snap_edge_dir
-                            
                             target_objs[i].location += translation_vec
                             
                         bpy.ops.ed.undo_push(message="Copy & Slide to Edge" if event.ctrl else "Slide Objects to Edge")
@@ -250,7 +252,6 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         region = context.region
         rv3d = context.region_data
         coord = self.mouse_pos
-        
         view_vector = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
         ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
 
@@ -291,7 +292,6 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 if vec_len > 0:
                     vec_dir = vec_edge / vec_len
                     proj_t = (proj_pt - v1).dot(vec_dir)
-                    
                     if 0 <= proj_t <= vec_len:
                         proj_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, proj_pt)
                         if proj_2d:
@@ -313,9 +313,18 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 self.snap_normal = normal
                 self.draw_highlight_verts.extend(face_verts_3d)
 
+    # --- HÀM ALIGN: THỰC THI THEO MIN / CENTER / MAX ---
     def align_objects(self, axis_index):
-        target_val = self.get_selection_center()[axis_index]
         all_objs = self.selected_objs + [self.active_obj]
+        
+        # Quyết định vị trí đích dựa theo vùng Hover
+        if self.hovered_align_mode == 'MIN':
+            target_val = min([obj.location[axis_index] for obj in all_objs])
+        elif self.hovered_align_mode == 'MAX':
+            target_val = max([obj.location[axis_index] for obj in all_objs])
+        else: # CENTER
+            target_val = self.get_selection_center()[axis_index]
+            
         for obj in all_objs:
             obj.location[axis_index] = target_val
         bpy.context.view_layer.update()
@@ -346,37 +355,53 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             obj.location[axis_index] = start_val + (i * dist_internal)
         bpy.context.view_layer.update()
 
+    # --- HÀM TRẢ VỀ CẢ TRỤC VÀ VỊ TRÍ HOVER ---
     def get_hovered_axis(self, context):
-        if not getattr(self, "active_obj", None): return None
+        if not getattr(self, "active_obj", None): return None, 'CENTER'
         
         region = context.region
         rv3d = context.region_data
         origin_3d = self.get_selection_center()
         
         dynamic_len = self.get_dynamic_scale(context, origin_3d, 60.0)
-        
         mouse_vec = Vector((self.mouse_pos[0], self.mouse_pos[1]))
+        
         best_axis = None
+        best_mode = 'CENTER'
         min_dist = 25.0 
         
         axes = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))]
         for i, axis in enumerate(axes):
+            # start_3d là phía ÂM (MIN), end_3d là phía DƯƠNG (MAX)
             start_3d = origin_3d - (axis * dynamic_len)
             end_3d = origin_3d + (axis * dynamic_len)
+            
             start_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, start_3d)
             end_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, end_3d)
             if not start_2d or not end_2d: continue
+            
             line_vec = end_2d - start_2d
             line_len = line_vec.length
             if line_len == 0: continue
+            
             line_dir = line_vec / line_len
             proj = (mouse_vec - start_2d).dot(line_dir) 
+            
             if 0 <= proj <= line_len:
                 closest_point = start_2d + line_dir * proj
                 dist = (mouse_vec - closest_point).length
                 if dist < min_dist:
-                    min_dist, best_axis = dist, i
-        return best_axis
+                    min_dist = dist
+                    best_axis = i
+                    # Chia 3 khúc: Dưới 30% là MIN, Trên 70% là MAX, giữa là CENTER
+                    if proj < line_len * 0.3:
+                        best_mode = 'MIN'
+                    elif proj > line_len * 0.7:
+                        best_mode = 'MAX'
+                    else:
+                        best_mode = 'CENTER'
+                        
+        return best_axis, best_mode
 
     def draw_3d(self, context):
         try:
@@ -438,6 +463,23 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 except: pass 
                 shader.bind()
                 batch.draw(shader)
+                
+                # --- VẼ CHẤM VÀNG ĐỂ BIẾT ĐANG ALIGN VÀO ĐÂU ---
+                point_3d = origin
+                axis_vec = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))][self.hovered_axis]
+                
+                if self.hovered_align_mode == 'MIN':
+                    point_3d = origin - (axis_vec * dynamic_len)
+                elif self.hovered_align_mode == 'MAX':
+                    point_3d = origin + (axis_vec * dynamic_len)
+                    
+                shader_pt = gpu.shader.from_builtin('3D_UNLIT_COLOR')
+                batch_pt = batch_for_shader(shader_pt, 'POINTS', {"pos": [point_3d], "color": [(1, 1, 0, 1)]})
+                try: gpu.state.point_size_set(12.0)
+                except: pass
+                shader_pt.bind()
+                batch_pt.draw(shader_pt)
+
                 gpu.state.blend_set('NONE')
                 gpu.state.depth_test_set('LESS_EQUAL')
             
@@ -462,7 +504,9 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             
             if self.hovered_axis is not None:
                 blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
-                blf.draw(font_id, "Đang chọn trục ảo...")
+                # Đổi text báo hiệu Min/Center/Max
+                mode_str = "TÂM" if self.hovered_align_mode == 'CENTER' else ("MIN (-)" if self.hovered_align_mode == 'MIN' else "MAX (+)")
+                blf.draw(font_id, f"Đang chọn trục ảo... (Căn dồn về {mode_str})")
             elif self.current_auto_mode == 'FACE':
                 blf.color(font_id, 0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else blf.color(font_id, 0.0, 1.0, 1.0, 1.0)
                 prefix = "[COPY] Đóng dấu vào MẶT" if self.is_ctrl_pressed else "Bắn từng vật vào MẶT"
