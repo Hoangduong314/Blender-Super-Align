@@ -1,0 +1,497 @@
+import bpy
+import gpu
+import blf
+from gpu_extras.batch import batch_for_shader
+from mathutils import Vector, geometry
+from bpy_extras import view3d_utils
+
+def get_shader():
+    shader_names = ['UNLIT', 'POLYLINE_UNLIT_COLOR', '3D_UNLIT_COLOR', '3D_SMOOTH_COLOR', 'POLYLINE_SMOOTH_COLOR']
+    for name in shader_names:
+        try: return gpu.shader.from_builtin(name)
+        except ValueError: continue
+    return None
+
+class OBJECT_OT_super_quick_align(bpy.types.Operator):
+    """Super Quick Align Tool (Pro Version)"""
+    bl_idname = "object.super_quick_align"
+    bl_label = "Super Quick Align Pro"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.area.type == 'VIEW_3D'
+    
+    def execute(self, context):
+        return self.invoke(context, None)
+
+    def invoke(self, context, event):
+        self.draw_handle_3d = None
+        self.draw_handle_2d = None
+        self.mouse_pos = (0, 0)
+        
+        if not context.active_object and len(context.selected_objects) >= 1:
+            context.view_layer.objects.active = context.selected_objects[0]
+
+        if getattr(context, "active_object", None) is None:
+            self.report({'WARNING'}, "LỖI: Bạn phải chọn ít nhất 1 vật thể!")
+            return {'CANCELLED'}
+
+        self.active_obj = context.active_object
+        self.selected_objs = [obj for obj in context.selected_objects if obj != self.active_obj]
+        
+        self.hovered_axis = None 
+        
+        self.snap_target = None 
+        self.snap_normal = Vector((0,0,1))
+        self.snap_edge_dir = Vector((1,0,0)) 
+        self.current_auto_mode = None 
+        
+        self.draw_highlight_verts = []
+        
+        self.distribute_axis = None
+        self.input_distance = ""
+        self.is_typing = False
+        self.is_ctrl_pressed = False # BIẾN MỚI: Theo dõi phím Ctrl
+
+        self.draw_handle_3d = bpy.types.SpaceView3D.draw_handler_add(
+            self.draw_3d, (context,), 'WINDOW', 'POST_VIEW'
+        )
+        self.draw_handle_2d = bpy.types.SpaceView3D.draw_handler_add(
+            self.draw_2d, (context,), 'WINDOW', 'POST_PIXEL'
+        )
+        
+        context.window_manager.modal_handler_add(self)
+        context.area.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+    def get_unit_multiplier(self, context):
+        unit_settings = context.scene.unit_settings
+        if unit_settings.system == 'NONE': return 1.0
+        multiplier = 1.0
+        length_unit = unit_settings.length_unit
+        if length_unit == 'KILOMETERS': multiplier = 1000.0
+        elif length_unit == 'METERS': multiplier = 1.0
+        elif length_unit == 'CENTIMETERS': multiplier = 0.01
+        elif length_unit == 'MILLIMETERS': multiplier = 0.001
+        elif length_unit == 'MICROMETERS': multiplier = 0.000001
+        elif length_unit == 'MILES': multiplier = 1609.344
+        elif length_unit == 'FEET': multiplier = 0.3048
+        elif length_unit == 'INCHES': multiplier = 0.0254
+        elif length_unit == 'THOU': multiplier = 0.0000254
+        return multiplier * unit_settings.scale_length
+
+    def get_unit_symbol(self, context):
+        unit_settings = context.scene.unit_settings
+        if unit_settings.system == 'NONE': return "Units"
+        symbols = {
+            'KILOMETERS': 'km', 'METERS': 'm', 'CENTIMETERS': 'cm', 
+            'MILLIMETERS': 'mm', 'MICROMETERS': 'µm', 'MILES': 'mi', 
+            'FEET': 'ft', 'INCHES': 'in', 'THOU': 'thou'
+        }
+        return symbols.get(unit_settings.length_unit, 'm')
+
+    def get_selection_center(self):
+        all_objs = self.selected_objs + [self.active_obj] if self.active_obj else []
+        if not all_objs: return Vector((0, 0, 0))
+        return sum([obj.location for obj in all_objs], Vector()) / len(all_objs)
+
+    def get_dynamic_scale(self, context, origin_3d, desired_pixels=60.0):
+        region = context.region
+        rv3d = context.region_data
+        loc_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, origin_3d)
+        if not loc_2d: 
+            cam_dist = (origin_3d - rv3d.view_matrix.inverted().translation).length
+            return cam_dist * 0.1
+        loc_3d_offset = view3d_utils.region_2d_to_location_3d(region, rv3d, loc_2d + Vector((100.0, 0.0)), origin_3d)
+        scale_per_100px = (loc_3d_offset - origin_3d).length
+        return scale_per_100px * (desired_pixels / 100.0)
+
+    def modal(self, context, event):
+        context.area.tag_redraw()
+        
+        if context.active_object:
+            self.active_obj = context.active_object
+            self.selected_objs = [obj for obj in context.selected_objects if obj != self.active_obj]
+
+        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
+            return {'PASS_THROUGH'}
+        
+        if event.type == 'RIGHTMOUSE' and event.value == 'RELEASE':
+            return {'RUNNING_MODAL'}
+            
+        if self.is_typing and event.value == 'PRESS':
+            if event.type in {'RET', 'NUMPAD_ENTER'}:
+                self.is_typing = False
+                return {'RUNNING_MODAL'}
+            elif event.type == 'BACK_SPACE':
+                self.input_distance = self.input_distance[:-1]
+                self.apply_exact_distance(context)
+                return {'RUNNING_MODAL'}
+            elif event.unicode.isdigit() or event.unicode in {'.', '-'}:
+                self.input_distance += event.unicode
+                self.apply_exact_distance(context)
+                return {'RUNNING_MODAL'}
+
+        if event.type == 'MOUSEMOVE':
+            self.mouse_pos = (event.mouse_region_x, event.mouse_region_y)
+            self.is_ctrl_pressed = event.ctrl # Lắng nghe phím Ctrl
+            
+            if event.shift or event.alt:
+                self.hovered_axis = self.get_hovered_axis(context)
+                self.snap_target = None
+                self.draw_highlight_verts.clear()
+            else:
+                self.hovered_axis = None
+                self.find_snap_target(context) 
+
+        if event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
+            self.cleanup(context)
+            return {'CANCELLED'}
+
+        if event.type == 'LEFTMOUSE':
+            if event.value == 'PRESS':
+                if event.shift and self.hovered_axis is not None:
+                    if len(self.selected_objs) < 1:
+                        self.report({'WARNING'}, "Cần chọn ít nhất 2 vật thể để Align!")
+                    else:
+                        self.align_objects(self.hovered_axis)
+                        bpy.ops.ed.undo_push(message="Align objects to center")
+                    return {'RUNNING_MODAL'}
+                        
+                elif event.alt and self.hovered_axis is not None:
+                    if len(self.selected_objs) < 2:
+                        self.report({'WARNING'}, "Cần chọn ít nhất 3 vật thể để Distribute!")
+                    else:
+                        self.distribute_objects_evenly(self.hovered_axis)
+                        self.distribute_axis = self.hovered_axis
+                        self.is_typing = True 
+                        self.input_distance = ""
+                        bpy.ops.ed.undo_push(message="Distribute evenly")
+                    return {'RUNNING_MODAL'}
+
+                elif event.shift and self.hovered_axis is None:
+                    region = context.region
+                    rv3d = context.region_data
+                    coord = (event.mouse_region_x, event.mouse_region_y)
+                    view_vector = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+                    ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+                    
+                    hit, location, normal, index, hit_obj, matrix = context.scene.ray_cast(
+                        context.view_layer.depsgraph, ray_origin, view_vector
+                    )
+                    
+                    if hit and hit_obj:
+                        hit_obj.select_set(not hit_obj.select_get())
+                        if hit_obj.select_get():
+                            context.view_layer.objects.active = hit_obj
+                        else:
+                            if hit_obj == context.active_object:
+                                sel = context.selected_objects
+                                context.view_layer.objects.active = sel[-1] if sel else None
+                                
+                        self.active_obj = context.active_object
+                        self.selected_objs = [o for o in context.selected_objects if o != self.active_obj]
+                    
+                elif not event.shift and not event.alt and self.snap_target is not None:
+                    all_objs = self.selected_objs + [self.active_obj]
+                    
+                    # --- XỬ LÝ NHÂN BẢN (COPY) NẾU GIỮ CTRL ---
+                    target_objs = []
+                    if event.ctrl:
+                        for obj in all_objs:
+                            new_obj = obj.copy() # Nhân bản Object
+                            if obj.data:
+                                new_obj.data = obj.data.copy() # Nhân bản luôn cả Mesh (Độc lập)
+                            context.collection.objects.link(new_obj)
+                            target_objs.append(new_obj)
+                    else:
+                        target_objs = all_objs # Không giữ Ctrl thì di chuyển vật gốc
+                    
+                    # --- THỰC HIỆN TỊNH TIẾN CHO TẬP HỢP ĐÍCH ---
+                    if self.current_auto_mode == 'FACE':
+                        for i, obj in enumerate(all_objs): # Đo khoảng cách dựa trên vật gốc
+                            bbox_corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+                            distances = [(corner - self.snap_target).dot(self.snap_normal) for corner in bbox_corners]
+                            min_dist = min(distances)
+                            
+                            # Di chuyển vật thể đích (Gốc hoặc Copy)
+                            target_objs[i].location -= (self.snap_normal * min_dist)
+                            
+                        bpy.ops.ed.undo_push(message="Copy & Stamp to Plane" if event.ctrl else "Project Objects to Plane")
+                    
+                    elif self.current_auto_mode == 'EDGE':
+                        for i, obj in enumerate(all_objs):
+                            bbox_corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+                            center_pt = sum(bbox_corners, Vector((0,0,0))) / 8.0
+                            
+                            vec_center_to_midpoint = self.snap_target - center_pt
+                            translation_vec = vec_center_to_midpoint.dot(self.snap_edge_dir) * self.snap_edge_dir
+                            
+                            target_objs[i].location += translation_vec
+                            
+                        bpy.ops.ed.undo_push(message="Copy & Slide to Edge" if event.ctrl else "Slide Objects to Edge")
+                        
+                    self.is_typing = False
+                    return {'RUNNING_MODAL'}
+                
+        return {'RUNNING_MODAL'} 
+
+    def find_snap_target(self, context):
+        region = context.region
+        rv3d = context.region_data
+        coord = self.mouse_pos
+        
+        view_vector = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+        ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+
+        hit, location, normal, index, obj, matrix = context.scene.ray_cast(
+            context.view_layer.depsgraph, ray_origin, view_vector
+        )
+
+        self.draw_highlight_verts.clear()
+        self.snap_target = None
+        self.current_auto_mode = None
+
+        if hit and obj.type == 'MESH':
+            mesh = obj.data
+            poly = mesh.polygons[index]
+            matrix_world = obj.matrix_world
+            verts = poly.vertices
+            
+            best_edge = None
+            best_edge_dir = None
+            min_dist_2d = 12.0 
+            edge_midpoint = None
+            
+            mouse_vec_2d = Vector((coord[0], coord[1]))
+            face_verts_3d = []
+            
+            for i in range(len(verts)):
+                v1_idx = verts[i]
+                v2_idx = verts[(i + 1) % len(verts)]
+                v1 = matrix_world @ mesh.vertices[v1_idx].co
+                v2 = matrix_world @ mesh.vertices[v2_idx].co
+                
+                face_verts_3d.extend([v1, v2]) 
+                
+                proj_pt, _ = geometry.intersect_point_line(location, v1, v2)
+                vec_edge = v2 - v1
+                vec_len = vec_edge.length
+                
+                if vec_len > 0:
+                    vec_dir = vec_edge / vec_len
+                    proj_t = (proj_pt - v1).dot(vec_dir)
+                    
+                    if 0 <= proj_t <= vec_len:
+                        proj_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, proj_pt)
+                        if proj_2d:
+                            dist_2d = (mouse_vec_2d - proj_2d).length
+                            if dist_2d < min_dist_2d:
+                                min_dist_2d = dist_2d
+                                best_edge = (v1, v2)
+                                best_edge_dir = vec_dir
+                                edge_midpoint = (v1 + v2) / 2.0
+
+            if best_edge:
+                self.current_auto_mode = 'EDGE'
+                self.snap_target = edge_midpoint
+                self.snap_edge_dir = best_edge_dir
+                self.draw_highlight_verts.extend([best_edge[0], best_edge[1]])
+            else:
+                self.current_auto_mode = 'FACE'
+                self.snap_target = location
+                self.snap_normal = normal
+                self.draw_highlight_verts.extend(face_verts_3d)
+
+    def align_objects(self, axis_index):
+        target_val = self.get_selection_center()[axis_index]
+        all_objs = self.selected_objs + [self.active_obj]
+        for obj in all_objs:
+            obj.location[axis_index] = target_val
+        bpy.context.view_layer.update()
+
+    def distribute_objects_evenly(self, axis_index):
+        all_objs = self.selected_objs + [self.active_obj]
+        all_objs.sort(key=lambda obj: obj.location[axis_index])
+        min_val = all_objs[0].location[axis_index]
+        max_val = all_objs[-1].location[axis_index]
+        step = (max_val - min_val) / (len(all_objs) - 1)
+        for i, obj in enumerate(all_objs):
+            obj.location[axis_index] = min_val + (i * step)
+        bpy.context.view_layer.update()
+
+    def apply_exact_distance(self, context):
+        try: dist_input = float(self.input_distance)
+        except ValueError: return 
+        
+        multiplier = self.get_unit_multiplier(context)
+        dist_internal = dist_input * multiplier
+        
+        axis_index = self.distribute_axis
+        all_objs = self.selected_objs + [self.active_obj]
+        all_objs.sort(key=lambda obj: obj.location[axis_index])
+        start_val = all_objs[0].location[axis_index]
+        
+        for i, obj in enumerate(all_objs):
+            obj.location[axis_index] = start_val + (i * dist_internal)
+        bpy.context.view_layer.update()
+
+    def get_hovered_axis(self, context):
+        if not getattr(self, "active_obj", None): return None
+        
+        region = context.region
+        rv3d = context.region_data
+        origin_3d = self.get_selection_center()
+        
+        dynamic_len = self.get_dynamic_scale(context, origin_3d, 60.0)
+        
+        mouse_vec = Vector((self.mouse_pos[0], self.mouse_pos[1]))
+        best_axis = None
+        min_dist = 25.0 
+        
+        axes = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))]
+        for i, axis in enumerate(axes):
+            start_3d = origin_3d - (axis * dynamic_len)
+            end_3d = origin_3d + (axis * dynamic_len)
+            start_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, start_3d)
+            end_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, end_3d)
+            if not start_2d or not end_2d: continue
+            line_vec = end_2d - start_2d
+            line_len = line_vec.length
+            if line_len == 0: continue
+            line_dir = line_vec / line_len
+            proj = (mouse_vec - start_2d).dot(line_dir) 
+            if 0 <= proj <= line_len:
+                closest_point = start_2d + line_dir * proj
+                dist = (mouse_vec - closest_point).length
+                if dist < min_dist:
+                    min_dist, best_axis = dist, i
+        return best_axis
+
+    def draw_3d(self, context):
+        try:
+            if not getattr(self, "active_obj", None): return
+            origin = self.get_selection_center() 
+            shader = get_shader()
+            if not shader: return
+            
+            if self.snap_target is not None and self.hovered_axis is None:
+                # Đổi màu xanh lá cây nếu đang giữ CTRL để báo hiệu Copy
+                if self.current_auto_mode == 'FACE':
+                    hl_color = (0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else (0.0, 1.0, 1.0, 1.0)
+                else:
+                    hl_color = (0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else (1.0, 0.5, 0.0, 1.0)
+                
+                if self.draw_highlight_verts:
+                    colors = [hl_color] * len(self.draw_highlight_verts)
+                    batch_lines = batch_for_shader(shader, 'LINES', {"pos": self.draw_highlight_verts, "color": colors})
+                    gpu.state.depth_test_set('NONE')
+                    gpu.state.blend_set('ALPHA')
+                    try: gpu.state.line_width_set(4.0)
+                    except: pass
+                    shader.bind()
+                    batch_lines.draw(shader)
+                    
+                    if self.current_auto_mode == 'EDGE':
+                        s = self.get_dynamic_scale(context, self.snap_target, 15.0) 
+                        cross_verts = [
+                            self.snap_target - Vector((s,0,0)), self.snap_target + Vector((s,0,0)),
+                            self.snap_target - Vector((0,s,0)), self.snap_target + Vector((0,s,0)),
+                            self.snap_target - Vector((0,0,s)), self.snap_target + Vector((0,0,s))
+                        ]
+                        cross_colors = [(1.0, 1.0, 0.0, 1.0)] * 6
+                        batch_cross = batch_for_shader(shader, 'LINES', {"pos": cross_verts, "color": cross_colors})
+                        batch_cross.draw(shader)
+                        
+                    gpu.state.blend_set('NONE')
+                    gpu.state.depth_test_set('LESS_EQUAL')
+                return
+
+            if self.hovered_axis is not None:
+                dynamic_len = self.get_dynamic_scale(context, origin, 60.0)
+                
+                coords = [
+                    origin - Vector((dynamic_len, 0, 0)), origin + Vector((dynamic_len, 0, 0)), 
+                    origin - Vector((0, dynamic_len, 0)), origin + Vector((0, dynamic_len, 0)), 
+                    origin - Vector((0, 0, dynamic_len)), origin + Vector((0, 0, dynamic_len))  
+                ]
+                base_colors = [(1.0, 0.2, 0.2), (0.2, 1.0, 0.2), (0.2, 0.5, 1.0)]
+                colors = []
+                for i in range(3):
+                    alpha = 1.0 if self.hovered_axis == i else 0.3
+                    colors.extend([(base_colors[i][0], base_colors[i][1], base_colors[i][2], alpha)] * 2)
+
+                batch = batch_for_shader(shader, 'LINES', {"pos": coords, "color": colors})
+
+                gpu.state.depth_test_set('NONE')
+                gpu.state.blend_set('ALPHA') 
+                try: gpu.state.line_width_set(4.0)
+                except: pass 
+                shader.bind()
+                batch.draw(shader)
+                gpu.state.blend_set('NONE')
+                gpu.state.depth_test_set('LESS_EQUAL')
+            
+        except Exception as e:
+            pass
+
+    def draw_2d(self, context):
+        font_id = 0
+        blf.position(font_id, 30, 80, 0)
+        blf.size(font_id, 20)
+        
+        if self.is_typing:
+            blf.color(font_id, 0.0, 1.0, 0.0, 1.0)
+            unit_sym = self.get_unit_symbol(context)
+            blf.draw(font_id, f"Khoảng cách Distribute: {self.input_distance} {unit_sym} (Nhấn Enter để chốt)")
+        else:
+            blf.color(font_id, 1.0, 1.0, 0.0, 1.0)
+            blf.draw(font_id, "[SUPER QUICK ALIGN PRO]")
+            
+            blf.position(font_id, 30, 50, 0)
+            blf.size(font_id, 16)
+            
+            if self.hovered_axis is not None:
+                blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+                blf.draw(font_id, "Đang chọn trục ảo...")
+            elif self.current_auto_mode == 'FACE':
+                blf.color(font_id, 0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else blf.color(font_id, 0.0, 1.0, 1.0, 1.0)
+                prefix = "[COPY] Đóng dấu vào MẶT" if self.is_ctrl_pressed else "Bắn từng vật vào MẶT"
+                blf.draw(font_id, f"Smart Hover: {prefix}")
+            elif self.current_auto_mode == 'EDGE':
+                blf.color(font_id, 0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else blf.color(font_id, 1.0, 0.5, 0.0, 1.0)
+                prefix = "[COPY] Đóng dấu dọc CẠNH" if self.is_ctrl_pressed else "Trượt từng vật theo CẠNH"
+                blf.draw(font_id, f"Smart Hover: {prefix}")
+            else:
+                blf.color(font_id, 0.5, 0.5, 0.5, 1.0)
+                blf.draw(font_id, "Đang tìm kiếm bề mặt... (Shift+Click để chọn thêm)")
+            
+            blf.position(font_id, 30, 30, 0)
+            blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+            blf.draw(font_id, "[CTRL] Copy | [SHIFT] Align/Chọn | [ALT] Distribute")
+
+    def cleanup(self, context):
+        if self.draw_handle_3d:
+            bpy.types.SpaceView3D.draw_handler_remove(self.draw_handle_3d, 'WINDOW')
+            self.draw_handle_3d = None
+        if self.draw_handle_2d:
+            bpy.types.SpaceView3D.draw_handler_remove(self.draw_handle_2d, 'WINDOW')
+            self.draw_handle_2d = None
+        context.area.tag_redraw()
+
+def menu_func(self, context):
+    self.layout.separator()
+    self.layout.operator_context = 'INVOKE_DEFAULT' 
+    self.layout.operator(OBJECT_OT_super_quick_align.bl_idname, icon='ALIGN_CENTER')
+
+def register():
+    bpy.utils.register_class(OBJECT_OT_super_quick_align)
+    bpy.types.VIEW3D_MT_object_context_menu.append(menu_func)
+
+def unregister():
+    bpy.utils.unregister_class(OBJECT_OT_super_quick_align)
+    bpy.types.VIEW3D_MT_object_context_menu.remove(menu_func)
+
+if __name__ == "__main__":
+    register()
