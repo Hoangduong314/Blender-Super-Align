@@ -1,3 +1,15 @@
+bl_info = {
+    "name": "Super Quick Align Pro",
+    "author": "Bạn và AI",
+    "version": (1, 0, 0),
+    "blender": (4, 0, 0), # Tương thích tốt với Blender 4.x và 5.x
+    "location": "View3D > Right Click Context Menu",
+    "description": "Căn gióng, giãn cách, bắt điểm thông minh và Copy vật thể siêu tốc",
+    "warning": "",
+    "doc_url": "",
+    "category": "Object",
+}
+
 import bpy
 import gpu
 import blf
@@ -52,7 +64,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         self.distribute_axis = None
         self.input_distance = ""
         self.is_typing = False
-        self.is_ctrl_pressed = False # BIẾN MỚI: Theo dõi phím Ctrl
+        self.is_ctrl_pressed = False 
 
         self.draw_handle_3d = bpy.types.SpaceView3D.draw_handler_add(
             self.draw_3d, (context,), 'WINDOW', 'POST_VIEW'
@@ -135,7 +147,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
 
         if event.type == 'MOUSEMOVE':
             self.mouse_pos = (event.mouse_region_x, event.mouse_region_y)
-            self.is_ctrl_pressed = event.ctrl # Lắng nghe phím Ctrl
+            self.is_ctrl_pressed = event.ctrl 
             
             if event.shift or event.alt:
                 self.hovered_axis = self.get_hovered_axis(context)
@@ -196,26 +208,23 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 elif not event.shift and not event.alt and self.snap_target is not None:
                     all_objs = self.selected_objs + [self.active_obj]
                     
-                    # --- XỬ LÝ NHÂN BẢN (COPY) NẾU GIỮ CTRL ---
                     target_objs = []
                     if event.ctrl:
                         for obj in all_objs:
-                            new_obj = obj.copy() # Nhân bản Object
+                            new_obj = obj.copy() 
                             if obj.data:
-                                new_obj.data = obj.data.copy() # Nhân bản luôn cả Mesh (Độc lập)
+                                new_obj.data = obj.data.copy() 
                             context.collection.objects.link(new_obj)
                             target_objs.append(new_obj)
                     else:
-                        target_objs = all_objs # Không giữ Ctrl thì di chuyển vật gốc
+                        target_objs = all_objs 
                     
-                    # --- THỰC HIỆN TỊNH TIẾN CHO TẬP HỢP ĐÍCH ---
                     if self.current_auto_mode == 'FACE':
-                        for i, obj in enumerate(all_objs): # Đo khoảng cách dựa trên vật gốc
+                        for i, obj in enumerate(all_objs): 
                             bbox_corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
                             distances = [(corner - self.snap_target).dot(self.snap_normal) for corner in bbox_corners]
                             min_dist = min(distances)
                             
-                            # Di chuyển vật thể đích (Gốc hoặc Copy)
                             target_objs[i].location -= (self.snap_normal * min_dist)
                             
                         bpy.ops.ed.undo_push(message="Copy & Stamp to Plane" if event.ctrl else "Project Objects to Plane")
@@ -377,7 +386,6 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             if not shader: return
             
             if self.snap_target is not None and self.hovered_axis is None:
-                # Đổi màu xanh lá cây nếu đang giữ CTRL để báo hiệu Copy
                 if self.current_auto_mode == 'FACE':
                     hl_color = (0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else (0.0, 1.0, 1.0, 1.0)
                 else:
