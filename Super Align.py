@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Super Quick Align Pro",
     "author": "Bạn và AI",
-    "version": (2, 5, 0),
+    "version": (3, 2, 0),
     "blender": (4, 0, 0), 
-    "location": "View3D > Toolbar (Phím T) hoặc Right Click Context Menu",
-    "description": "Tích hợp Toolbar | Absolute Snap | Align | Distribute | Live Undo",
+    "location": "View3D > Toolbar (Phím T)",
+    "description": "Trục ảo tự co giãn theo vật thể | Thu hẹp vùng Hover 2 đầu mút",
     "warning": "",
     "doc_url": "",
     "category": "Object",
@@ -13,6 +13,7 @@ bl_info = {
 import bpy
 import gpu
 import blf
+import os
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector, geometry
 from bpy_extras import view3d_utils
@@ -29,6 +30,8 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
     bl_idname = "object.super_quick_align"
     bl_label = "Super Quick Align Pro"
     bl_options = {'REGISTER', 'UNDO'}
+    
+    _is_running = False
 
     @classmethod
     def poll(cls, context):
@@ -38,20 +41,19 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         return self.invoke(context, None)
 
     def invoke(self, context, event):
+        if OBJECT_OT_super_quick_align._is_running:
+            return {'PASS_THROUGH'}
+        
+        OBJECT_OT_super_quick_align._is_running = True
         self.draw_handle_3d = None
         self.draw_handle_2d = None
         self.mouse_pos = (0, 0)
         
-        if not context.active_object and len(context.selected_objects) >= 1:
-            context.view_layer.objects.active = context.selected_objects[0]
-
-        if getattr(context, "active_object", None) is None:
-            self.report({'WARNING'}, "LỖI: Bạn phải chọn ít nhất 1 vật thể!")
-            return {'CANCELLED'}
-
-        self.active_obj = context.active_object
+        self.active_obj = getattr(context, "active_object", None)
         self.selected_objs = [obj for obj in context.selected_objects if obj != self.active_obj]
         
+        self.tool_mode = 'SNAP' 
+        self.base_mode = 'SNAP'
         self.show_axes = False
         self.hovered_axis = None 
         self.hovered_align_mode = 'CENTER' 
@@ -66,9 +68,10 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         self.distribute_axis = None
         self.input_distance = ""
         self.is_typing = False
+        self.current_preview_distance_str = "" 
         
         self.is_ctrl_pressed = False 
-        self.is_alt_pressed = False
+        self.is_tab_pressed = False
         self.is_shift_pressed = False
 
         self.draw_handle_3d = bpy.types.SpaceView3D.draw_handler_add(
@@ -124,10 +127,51 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         scale_per_100px = (loc_3d_offset - origin_3d).length
         return scale_per_100px * (desired_pixels / 100.0)
 
+    def raycast_select(self, context, event):
+        region = context.region
+        rv3d = context.region_data
+        coord = (event.mouse_region_x, event.mouse_region_y)
+        view_vector = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+        ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+        
+        hit, location, normal, index, hit_obj, matrix = context.scene.ray_cast(
+            context.view_layer.depsgraph, ray_origin, view_vector
+        )
+        
+        if hit and hit_obj:
+            hit_obj.select_set(not hit_obj.select_get())
+            if hit_obj.select_get():
+                context.view_layer.objects.active = hit_obj
+            else:
+                if hit_obj == context.active_object:
+                    sel = context.selected_objects
+                    context.view_layer.objects.active = sel[-1] if sel else None
+                    
+            self.active_obj = context.active_object
+            self.selected_objs = [o for o in context.selected_objects if o != self.active_obj]
+
+    def update_preview_distance(self, context):
+        if self.tool_mode == 'DISTRIBUTE' and self.hovered_axis is not None and self.hovered_align_mode == 'CENTER':
+            all_objs = self.selected_objs + [self.active_obj]
+            if len(all_objs) >= 2:
+                axis_idx = self.hovered_axis
+                vals = [obj.location[axis_idx] for obj in all_objs]
+                min_val = min(vals)
+                max_val = max(vals)
+                step_internal = (max_val - min_val) / (len(all_objs) - 1)
+                
+                multiplier = self.get_unit_multiplier(context)
+                step_display = step_internal / multiplier if multiplier != 0 else step_internal
+                unit_sym = self.get_unit_symbol(context)
+                self.current_preview_distance_str = f"{step_display:.2f} {unit_sym}"
+            else:
+                self.current_preview_distance_str = ""
+        else:
+            self.current_preview_distance_str = ""
+
     def execute_snap(self, context, is_copy):
         all_objs = self.selected_objs + [self.active_obj]
         target_objs = []
-        
         if is_copy:
             for obj in all_objs:
                 new_obj = obj.copy() 
@@ -146,9 +190,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 
                 if center_dist >= 0: dist_to_move = min(distances)
                 else: dist_to_move = max(distances)
-                    
                 target_objs[i].location -= (self.snap_normal * dist_to_move)
-                
             bpy.ops.ed.undo_push(message="Copy & Stamp to Plane" if is_copy else "Absolute Snap to Plane")
         
         elif self.current_auto_mode == 'EDGE':
@@ -160,8 +202,47 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 target_objs[i].location += translation_vec
             bpy.ops.ed.undo_push(message="Copy & Slide to Edge" if is_copy else "Snap Objects to Edge")
 
+    def update_mode_logic(self, context):
+        total_selected = len(context.selected_objects)
+        
+        if total_selected > 1:
+            self.base_mode = 'DISTRIBUTE'
+        else:
+            self.base_mode = 'SNAP'
+            
+        if self.is_tab_pressed:
+            self.tool_mode = 'SNAP'
+        else:
+            self.tool_mode = self.base_mode
+
+        if self.is_shift_pressed:
+            self.show_axes = False
+            self.snap_target = None
+            self.hovered_axis = None
+            self.current_preview_distance_str = ""
+            self.draw_highlight_verts.clear()
+        else:
+            if self.tool_mode == 'DISTRIBUTE':
+                self.show_axes = True
+                self.snap_target = None
+                self.draw_highlight_verts.clear()
+                self.hovered_axis, self.hovered_align_mode = self.get_hovered_axis(context)
+                self.update_preview_distance(context)
+            else:
+                self.show_axes = False
+                self.hovered_axis = None
+                self.current_preview_distance_str = ""
+                self.find_snap_target(context)
+
     def modal(self, context, event):
         context.area.tag_redraw()
+        
+        if context.active_object:
+            self.active_obj = context.active_object
+            self.selected_objs = [obj for obj in context.selected_objects if obj != self.active_obj]
+        else:
+            self.active_obj = None
+            self.selected_objs = []
 
         if event.type == 'Z' and event.value == 'PRESS' and (event.ctrl or event.oskey):
             try:
@@ -171,18 +252,15 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 else:
                     bpy.ops.ed.undo()
                     self.report({'INFO'}, "Undo: Đã lùi lại 1 bước")
-            except Exception as e:
-                pass
-                
+            except Exception as e: pass
+            
             try:
                 self.active_obj = bpy.context.active_object
                 if self.active_obj:
                     self.selected_objs = [obj for obj in bpy.context.selected_objects if obj != self.active_obj]
                 else:
                     self.selected_objs = []
-            except ReferenceError:
-                pass
-                
+            except ReferenceError: pass
             return {'RUNNING_MODAL'}
 
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
@@ -190,7 +268,21 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         
         if event.type == 'RIGHTMOUSE' and event.value == 'RELEASE':
             return {'RUNNING_MODAL'}
-
+            
+        if event.type in {'LEFT_SHIFT', 'RIGHT_SHIFT', 'LEFT_CTRL', 'RIGHT_CTRL'}:
+            self.is_shift_pressed = event.shift
+            self.is_ctrl_pressed = event.ctrl
+            self.update_mode_logic(context)
+            return {'RUNNING_MODAL'}
+            
+        if event.type == 'TAB':
+            if event.value == 'PRESS':
+                self.is_tab_pressed = True
+            elif event.value == 'RELEASE':
+                self.is_tab_pressed = False
+            self.update_mode_logic(context)
+            return {'RUNNING_MODAL'}
+            
         if self.is_typing and event.value == 'PRESS':
             if event.type in {'RET', 'NUMPAD_ENTER'}:
                 self.is_typing = False
@@ -204,66 +296,42 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 self.apply_exact_distance(context)
                 return {'RUNNING_MODAL'}
 
-        if event.type in {'LEFT_SHIFT', 'RIGHT_SHIFT', 'LEFT_ALT', 'RIGHT_ALT', 'LEFT_CTRL', 'RIGHT_CTRL'}:
-            self.is_shift_pressed = event.shift
-            self.is_alt_pressed = event.alt
-            self.is_ctrl_pressed = event.ctrl
-            
-            if event.shift or event.alt:
-                self.show_axes = True
-                self.snap_target = None
-                self.draw_highlight_verts.clear()
-                self.hovered_axis, self.hovered_align_mode = self.get_hovered_axis(context)
-            else:
-                self.show_axes = False
-                self.hovered_axis = None
-                self.find_snap_target(context)
-                
-            return {'RUNNING_MODAL'}
-
         if event.type == 'MOUSEMOVE':
             self.mouse_pos = (event.mouse_region_x, event.mouse_region_y)
-            self.is_ctrl_pressed = event.ctrl 
-            self.is_alt_pressed = event.alt
-            self.is_shift_pressed = event.shift
-            
-            if event.shift or event.alt:
-                self.show_axes = True
-                self.snap_target = None
-                self.draw_highlight_verts.clear()
-                self.hovered_axis, self.hovered_align_mode = self.get_hovered_axis(context)
-            else:
-                self.show_axes = False
-                self.hovered_axis = None
-                self.find_snap_target(context) 
+            self.update_mode_logic(context)
+            return {'RUNNING_MODAL'} 
 
-        if event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
+        if event.type in {'ESC'} and event.value == 'PRESS':
             self.cleanup(context)
             return {'CANCELLED'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             if event.shift:
-                if self.hovered_axis is not None:
-                    if len(self.selected_objs) < 1:
-                        self.report({'WARNING'}, "Cần chọn ít nhất 2 vật thể để Align!")
-                    else:
-                        self.align_objects(self.hovered_axis)
-                        bpy.ops.ed.undo_push(message=f"Align objects to {self.hovered_align_mode}")
-                        
-            elif event.alt:
-                if self.hovered_axis is not None:
-                    if len(self.selected_objs) < 2:
-                        self.report({'WARNING'}, "Cần chọn ít nhất 3 vật thể để Distribute!")
-                    else:
-                        self.distribute_objects_evenly(self.hovered_axis)
-                        self.distribute_axis = self.hovered_axis
-                        self.is_typing = True 
-                        self.input_distance = ""
-                        bpy.ops.ed.undo_push(message="Distribute evenly")
+                self.raycast_select(context, event)
+                self.update_mode_logic(context)
+                return {'RUNNING_MODAL'}
 
-            elif not event.shift and not event.alt:
+            if self.tool_mode == 'SNAP':
                 if self.snap_target is not None:
-                    self.execute_snap(context, is_copy=event.ctrl)
+                    self.execute_snap(context, is_copy=event.ctrl) 
+                    return {'RUNNING_MODAL'}
+                        
+            elif self.tool_mode == 'DISTRIBUTE':
+                if self.hovered_axis is not None:
+                    if self.hovered_align_mode in {'MIN', 'MAX'}:
+                        if len(context.selected_objects) > 0:
+                            self.align_objects(self.hovered_axis, self.hovered_align_mode)
+                            bpy.ops.ed.undo_push(message=f"Align objects to {self.hovered_align_mode}")
+                    else:
+                        if len(context.selected_objects) > 1:
+                            self.distribute_objects_evenly(self.hovered_axis)
+                            self.distribute_axis = self.hovered_axis
+                            self.is_typing = True 
+                            self.input_distance = ""
+                            bpy.ops.ed.undo_push(message="Distribute evenly")
+                    return {'RUNNING_MODAL'}
+                    
+            return {'PASS_THROUGH'}
 
         return {'RUNNING_MODAL'} 
 
@@ -332,14 +400,12 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 self.snap_normal = normal
                 self.draw_highlight_verts.extend(face_verts_3d)
 
-    def align_objects(self, axis_index):
+    def align_objects(self, axis_index, mode):
         all_objs = self.selected_objs + [self.active_obj]
-        if self.hovered_align_mode == 'MIN':
+        if mode == 'MIN':
             target_val = min([obj.location[axis_index] for obj in all_objs])
-        elif self.hovered_align_mode == 'MAX':
+        elif mode == 'MAX':
             target_val = max([obj.location[axis_index] for obj in all_objs])
-        else: 
-            target_val = self.get_selection_center()[axis_index]
             
         for obj in all_objs:
             obj.location[axis_index] = target_val
@@ -365,12 +431,17 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         axis_index = self.distribute_axis
         all_objs = self.selected_objs + [self.active_obj]
         all_objs.sort(key=lambda obj: obj.location[axis_index])
-        start_val = all_objs[0].location[axis_index]
+        
+        center_val = sum(obj.location[axis_index] for obj in all_objs) / len(all_objs)
+        total_width = dist_internal * (len(all_objs) - 1)
+        start_val = center_val - (total_width / 2.0)
         
         for i, obj in enumerate(all_objs):
             obj.location[axis_index] = start_val + (i * dist_internal)
+            
         bpy.context.view_layer.update()
 
+    # --- THUẬT TOÁN MỚI: TÍNH TOÁN CHIỀU DÀI TRỤC THEO BOUNDING VÀ VÙNG HOVER CỐ ĐỊNH ---
     def get_hovered_axis(self, context):
         if not getattr(self, "active_obj", None): return None, 'CENTER'
         
@@ -378,7 +449,8 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         rv3d = context.region_data
         origin_3d = self.get_selection_center()
         
-        dynamic_len = self.get_dynamic_scale(context, origin_3d, 60.0)
+        # Thêm lề (margin) 40 pixels không gian màn hình vào đuôi trục ảo
+        margin_3d = self.get_dynamic_scale(context, origin_3d, 40.0) 
         mouse_vec = Vector((self.mouse_pos[0], self.mouse_pos[1]))
         
         best_axis = None
@@ -386,9 +458,25 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         min_dist = 25.0 
         
         axes = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))]
+        all_objs = self.selected_objs + [self.active_obj]
+        
         for i, axis in enumerate(axes):
-            start_3d = origin_3d - (axis * dynamic_len)
-            end_3d = origin_3d + (axis * dynamic_len)
+            # Tính giới hạn toạ độ theo trục
+            min_val = min(obj.location[i] for obj in all_objs)
+            max_val = max(obj.location[i] for obj in all_objs)
+            
+            # Đảm bảo trục không bị biến mất nếu các vật thể trùng nhau
+            if max_val - min_val < margin_3d:
+                start_val = origin_3d[i] - margin_3d
+                end_val = origin_3d[i] + margin_3d
+            else:
+                start_val = min_val - margin_3d
+                end_val = max_val + margin_3d
+                
+            start_3d = origin_3d.copy()
+            start_3d[i] = start_val
+            end_3d = origin_3d.copy()
+            end_3d[i] = end_val
             
             start_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, start_3d)
             end_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, end_3d)
@@ -407,9 +495,20 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 if dist < min_dist:
                     min_dist = dist
                     best_axis = i
-                    if proj < line_len * 0.3: best_mode = 'MIN'
-                    elif proj > line_len * 0.7: best_mode = 'MAX'
-                    else: best_mode = 'CENTER'
+                    
+                    # Giới hạn độ lớn vùng Hover cố định 30 pixels ở 2 mút
+                    hover_zone_px = 30.0 
+                    
+                    # Nếu trục trên màn hình quá ngắn, chia tỷ lệ 15% / 70% / 15%
+                    if line_len < hover_zone_px * 2.5:
+                        if proj < line_len * 0.15: best_mode = 'MIN'
+                        elif proj > line_len * 0.85: best_mode = 'MAX'
+                        else: best_mode = 'CENTER'
+                    # Nếu trục đủ dài, khóa chết 30 pixels ở mép
+                    else:
+                        if proj < hover_zone_px: best_mode = 'MIN'
+                        elif proj > line_len - hover_zone_px: best_mode = 'MAX'
+                        else: best_mode = 'CENTER'
                         
         return best_axis, best_mode
 
@@ -420,10 +519,9 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             shader = get_shader()
             if not shader: return
             
-            if not self.show_axes and self.snap_target is not None:
-                if self.current_auto_mode == 'FACE':
-                    hl_color = (0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else (0.0, 1.0, 1.0, 1.0)
-                else:
+            if self.tool_mode == 'SNAP' and self.snap_target is not None and not self.is_shift_pressed:
+                hl_color = (0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else (0.0, 1.0, 1.0, 1.0)
+                if self.current_auto_mode == 'EDGE':
                     hl_color = (0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else (1.0, 0.5, 0.0, 1.0)
                 
                 if self.draw_highlight_verts:
@@ -451,17 +549,32 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                     gpu.state.depth_test_set('LESS_EQUAL')
                 return
 
-            if self.show_axes:
-                dynamic_len = self.get_dynamic_scale(context, origin, 60.0)
+            if self.show_axes and not self.is_shift_pressed:
+                margin_3d = self.get_dynamic_scale(context, origin, 40.0)
+                all_objs = self.selected_objs + [self.active_obj]
                 
-                coords = [
-                    origin - Vector((dynamic_len, 0, 0)), origin + Vector((dynamic_len, 0, 0)), 
-                    origin - Vector((0, dynamic_len, 0)), origin + Vector((0, dynamic_len, 0)), 
-                    origin - Vector((0, 0, dynamic_len)), origin + Vector((0, 0, dynamic_len))  
-                ]
+                coords = []
                 base_colors = [(1.0, 0.2, 0.2), (0.2, 1.0, 0.2), (0.2, 0.5, 1.0)]
                 colors = []
+                
+                # Vẽ lại các đoạn trục co giãn theo toạ độ
                 for i in range(3):
+                    min_val = min(obj.location[i] for obj in all_objs)
+                    max_val = max(obj.location[i] for obj in all_objs)
+                    
+                    if max_val - min_val < margin_3d:
+                        start_val = origin[i] - margin_3d
+                        end_val = origin[i] + margin_3d
+                    else:
+                        start_val = min_val - margin_3d
+                        end_val = max_val + margin_3d
+                        
+                    start_3d = origin.copy()
+                    start_3d[i] = start_val
+                    end_3d = origin.copy()
+                    end_3d[i] = end_val
+                    
+                    coords.extend([start_3d, end_3d])
                     alpha = 1.0 if self.hovered_axis == i else 0.3
                     colors.extend([(base_colors[i][0], base_colors[i][1], base_colors[i][2], alpha)] * 2)
 
@@ -474,12 +587,63 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 shader.bind()
                 batch.draw(shader)
                 
-                if self.is_shift_pressed and self.hovered_axis is not None:
-                    point_3d = origin
-                    axis_vec = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))][self.hovered_axis]
+                # --- VẼ DIMENSION LINES ---
+                if self.hovered_axis is not None and self.hovered_align_mode == 'CENTER' and len(all_objs) >= 2:
+                    axis_idx = self.hovered_axis
+                    axis_vec = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))][axis_idx]
+                    sorted_objs = sorted(all_objs, key=lambda obj: obj.location[axis_idx])
                     
-                    if self.hovered_align_mode == 'MIN': point_3d = origin - (axis_vec * dynamic_len)
-                    elif self.hovered_align_mode == 'MAX': point_3d = origin + (axis_vec * dynamic_len)
+                    rv3d = context.region_data
+                    cam_vec = rv3d.view_matrix.inverted().col[2].xyz
+                    tick_vec = axis_vec.cross(cam_vec).normalized()
+                    if tick_vec.length == 0: 
+                        tick_vec = Vector((0,1,0)) if axis_idx != 1 else Vector((1,0,0))
+                        
+                    tick_size = self.get_dynamic_scale(context, origin, 8.0) 
+                    dim_lines = []
+                    tick_lines = []
+                    
+                    for i in range(len(sorted_objs) - 1):
+                        p1 = origin.copy()
+                        p1[axis_idx] = sorted_objs[i].location[axis_idx]
+                        p2 = origin.copy()
+                        p2[axis_idx] = sorted_objs[i+1].location[axis_idx]
+                        
+                        dim_lines.extend([p1, p2])
+                        tick_lines.extend([p1 - tick_vec*tick_size, p1 + tick_vec*tick_size])
+                        tick_lines.extend([p2 - tick_vec*tick_size, p2 + tick_vec*tick_size])
+
+                    color = (base_colors[axis_idx][0], base_colors[axis_idx][1], base_colors[axis_idx][2], 0.7)
+                    if dim_lines:
+                        batch_dim = batch_for_shader(shader, 'LINES', {"pos": dim_lines, "color": [color]*len(dim_lines)})
+                        try: gpu.state.line_width_set(2.0)
+                        except: pass
+                        batch_dim.draw(shader)
+                        
+                    if tick_lines:
+                        batch_tick = batch_for_shader(shader, 'LINES', {"pos": tick_lines, "color": [(1, 1, 1, 0.6)]*len(tick_lines)})
+                        try: gpu.state.line_width_set(1.0)
+                        except: pass
+                        batch_tick.draw(shader)
+
+                # --- VẼ NGÔI SAO ALIGN Ở MIN/MAX TƯƠNG ỨNG MỚI ---
+                if self.hovered_axis is not None and self.hovered_align_mode in {'MIN', 'MAX'}:
+                    axis_idx = self.hovered_axis
+                    min_val = min(obj.location[axis_idx] for obj in all_objs)
+                    max_val = max(obj.location[axis_idx] for obj in all_objs)
+                    
+                    if max_val - min_val < margin_3d:
+                        start_val = origin[axis_idx] - margin_3d
+                        end_val = origin[axis_idx] + margin_3d
+                    else:
+                        start_val = min_val - margin_3d
+                        end_val = max_val + margin_3d
+                        
+                    point_3d = origin.copy()
+                    if self.hovered_align_mode == 'MIN':
+                        point_3d[axis_idx] = start_val
+                    else:
+                        point_3d[axis_idx] = end_val
                         
                     s = self.get_dynamic_scale(context, point_3d, 12.0) 
                     pt_verts = [
@@ -487,7 +651,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                         point_3d - Vector((0,s,0)), point_3d + Vector((0,s,0)),
                         point_3d - Vector((0,0,s)), point_3d + Vector((0,0,s))
                     ]
-                    pt_colors = [(1.0, 1.0, 0.0, 1.0)] * 6
+                    pt_colors = [(1.0, 1.0, 0.0, 1.0)] * 6 
                     batch_pt = batch_for_shader(shader, 'LINES', {"pos": pt_verts, "color": pt_colors})
                     try: gpu.state.line_width_set(8.0) 
                     except: pass
@@ -501,66 +665,107 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
 
     def draw_2d(self, context):
         font_id = 0
+        all_objs = self.selected_objs + [self.active_obj]
         
+        if self.tool_mode == 'DISTRIBUTE' and self.hovered_axis is not None and self.hovered_align_mode == 'CENTER' and len(all_objs) >= 2 and not self.is_shift_pressed:
+            axis_idx = self.hovered_axis
+            origin = self.get_selection_center()
+            sorted_objs = sorted(all_objs, key=lambda obj: obj.location[axis_idx])
+            multiplier = self.get_unit_multiplier(context)
+            unit_sym = self.get_unit_symbol(context)
+            
+            for i in range(len(sorted_objs) - 1):
+                p1 = origin.copy()
+                p1[axis_idx] = sorted_objs[i].location[axis_idx]
+                p2 = origin.copy()
+                p2[axis_idx] = sorted_objs[i+1].location[axis_idx]
+                
+                mid_pt = (p1 + p2) / 2.0
+                mid_2d = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, mid_pt)
+                
+                if mid_2d:
+                    dist = abs(p2[axis_idx] - p1[axis_idx])
+                    display_dist = dist / multiplier if multiplier != 0 else dist
+                    dist_str = f"{display_dist:.2f} {unit_sym}"
+                    
+                    blf.position(font_id, mid_2d.x - 20, mid_2d.y + 10, 0)
+                    blf.size(font_id, 14)
+                    blf.color(font_id, 0.0, 1.0, 1.0, 1.0) 
+                    blf.enable(font_id, blf.SHADOW)
+                    blf.shadow(font_id, 3, 0.0, 0.0, 0.0, 0.8)
+                    blf.shadow_offset(font_id, 1, -1)
+                    blf.draw(font_id, dist_str)
+                    blf.disable(font_id, blf.SHADOW)
+
         if self.is_typing:
             blf.position(font_id, 30, 110, 0)
             blf.size(font_id, 24)
             blf.color(font_id, 0.0, 1.0, 0.0, 1.0)
             unit_sym = self.get_unit_symbol(context)
-            blf.draw(font_id, f"Khoảng cách Distribute: {self.input_distance} {unit_sym} (Nhấn Enter chốt)")
+            blf.draw(font_id, f"Giãn cách: {self.input_distance} {unit_sym} (Nhấn Enter để chốt)")
             
         blf.position(font_id, 30, 80, 0)
         blf.size(font_id, 26)
         
+        total_selected = len(context.selected_objects)
+        
         if self.is_shift_pressed:
-            blf.color(font_id, 1.0, 0.8, 0.0, 1.0) 
-            blf.draw(font_id, "[CHẾ ĐỘ: ALIGN TRỤC ẢO]")
-        elif self.is_alt_pressed:
-            blf.color(font_id, 0.0, 0.8, 1.0, 1.0) 
-            blf.draw(font_id, "[CHẾ ĐỘ: DISTRIBUTE (Giãn đều)]")
-        else:
+            blf.color(font_id, 1.0, 1.0, 1.0, 1.0) 
+            blf.draw(font_id, "[CHẾ ĐỘ: CHỌN VẬT THỂ]")
+        elif self.is_tab_pressed:
+            blf.color(font_id, 1.0, 0.5, 0.0, 1.0) 
+            blf.draw(font_id, "[ÉP CHẾ ĐỘ: SMART SNAP]")
+        elif total_selected <= 1:
             blf.color(font_id, 0.0, 1.0, 0.8, 1.0) 
-            blf.draw(font_id, "[CHẾ ĐỘ: SMART SNAP]")
+            blf.draw(font_id, "[CHẾ ĐỘ: SMART SNAP (1 Vật thể)]")
+        else:
+            blf.color(font_id, 0.0, 0.8, 1.0, 1.0) 
+            blf.draw(font_id, f"[CHẾ ĐỘ: DISTRIBUTE ({total_selected} Vật thể)]")
             
         blf.position(font_id, 30, 50, 0)
         blf.size(font_id, 18)
         
         if self.is_shift_pressed:
-            if self.hovered_axis is not None:
-                m_str = "TÂM" if self.hovered_align_mode == 'CENTER' else ("MIN (-)" if self.hovered_align_mode == 'MIN' else "MAX (+)")
-                blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
-                blf.draw(font_id, f"Căn dồn về phía {m_str}")
-            else:
-                blf.color(font_id, 0.7, 0.7, 0.7, 1.0)
-                blf.draw(font_id, "Rê chuột lên trục cần căn gióng...")
-                
-        elif self.is_alt_pressed:
-            if self.hovered_axis is not None:
-                blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
-                blf.draw(font_id, "Click vào trục để chia đều khoảng cách!")
-            else:
-                blf.color(font_id, 0.7, 0.7, 0.7, 1.0)
-                blf.draw(font_id, "Rê chuột lên trục cần giãn cách...")
-                
-        else: 
-            if self.current_auto_mode == 'FACE':
-                blf.color(font_id, 0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else blf.color(font_id, 0.0, 1.0, 1.0, 1.0)
-                txt = "[COPY] Đóng dấu vật thể vào mặt" if self.is_ctrl_pressed else "Bắn vật thể chạm mặt (Tuyệt đối 2 chiều)"
-                blf.draw(font_id, txt)
-            elif self.current_auto_mode == 'EDGE':
-                blf.color(font_id, 0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else blf.color(font_id, 1.0, 0.5, 0.0, 1.0)
-                txt = "[COPY] Trượt copy dọc theo viền" if self.is_ctrl_pressed else "Trượt vật thể song song theo viền"
-                blf.draw(font_id, txt)
-            else:
-                blf.color(font_id, 0.5, 0.5, 0.5, 1.0)
-                blf.draw(font_id, "Rê chuột lên bề mặt hoặc mép cạnh để bắt điểm...")
+            blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+            blf.draw(font_id, "Click vào các vật thể khác để chọn thêm hoặc loại bỏ...")
+        else:
+            if self.tool_mode == 'SNAP':
+                if self.current_auto_mode == 'FACE':
+                    blf.color(font_id, 0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else blf.color(font_id, 0.0, 1.0, 1.0, 1.0)
+                    txt = "[COPY] Đóng dấu vật thể vào mặt" if self.is_ctrl_pressed else "Bắn vật thể chạm mặt (Tuyệt đối 2 chiều)"
+                    blf.draw(font_id, txt)
+                elif self.current_auto_mode == 'EDGE':
+                    blf.color(font_id, 0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else blf.color(font_id, 1.0, 0.5, 0.0, 1.0)
+                    txt = "[COPY] Trượt copy dọc theo viền" if self.is_ctrl_pressed else "Trượt vật thể song song theo viền"
+                    blf.draw(font_id, txt)
+                else:
+                    blf.color(font_id, 0.5, 0.5, 0.5, 1.0)
+                    blf.draw(font_id, "Rê chuột lên bề mặt hoặc mép cạnh để bắt điểm...")
+                        
+            elif self.tool_mode == 'DISTRIBUTE':
+                if self.hovered_axis is not None:
+                    if self.hovered_align_mode in {'MIN', 'MAX'}:
+                        m_str = "MIN (-)" if self.hovered_align_mode == 'MIN' else "MAX (+)"
+                        blf.color(font_id, 1.0, 0.8, 0.0, 1.0)
+                        blf.draw(font_id, f"Click để Dồn toàn bộ {total_selected} vật thể về {m_str}")
+                    else:
+                        blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+                        blf.draw(font_id, "Click giữa trục để Giãn đều. Nhập '0' để Gom vào tâm!")
+                else:
+                    blf.color(font_id, 0.7, 0.7, 0.7, 1.0)
+                    blf.draw(font_id, "Rê chuột vào Trục: Khúc giữa -> Giãn | Hai đầu (30px) -> Dồn (Align)")
 
         blf.position(font_id, 30, 25, 0)
         blf.size(font_id, 14)
         blf.color(font_id, 0.8, 0.8, 0.8, 1.0)
-        blf.draw(font_id, "Không giữ: Snap | [SHIFT] Align | [ALT] Distribute | [CTRL] Copy | [CTRL+Z] Undo")
+        
+        if total_selected > 1 and not self.is_tab_pressed:
+            blf.draw(font_id, "Tự động phân tích nhiều vật thể | [GIỮ TAB] Ép xài Snap | [SHIFT] Chọn thêm")
+        else:
+            blf.draw(font_id, "Chỉ 1 vật thể: Snap | [CTRL] Copy Snap | [SHIFT] Click Chọn thêm vật thể")
 
     def cleanup(self, context):
+        OBJECT_OT_super_quick_align._is_running = False
         if self.draw_handle_3d:
             bpy.types.SpaceView3D.draw_handler_remove(self.draw_handle_3d, 'WINDOW')
             self.draw_handle_3d = None
@@ -569,19 +774,16 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             self.draw_handle_2d = None
         context.area.tag_redraw()
 
-# --- 1. LỚP ĐĂNG KÝ TOOL VÀO THANH TOOLBAR (PHÍM T) ---
 class VIEW3D_WST_super_align(bpy.types.WorkSpaceTool):
     bl_space_type = 'VIEW_3D'
     bl_context_mode = 'OBJECT'
     
     bl_idname = "tool.super_quick_align"
     bl_label = "Super Align"
-    bl_description = "Công cụ thông minh: Align, Distribute, và Snap"
-    bl_icon = "ops.transform.translate" # Icon mũi tên di chuyển
-    
+    bl_description = "Công cụ thông minh tự động đoán ý định dựa trên số lượng vật thể"
+    bl_icon = "ops.transform.translate"
     bl_widget = None
     
-    # Gán thao tác chuột trái để kích hoạt lệnh Modal của chúng ta
     bl_keymap = (
         ("object.super_quick_align", {"type": 'LEFTMOUSE', "value": 'PRESS'}, None),
     )
@@ -591,17 +793,14 @@ def menu_func(self, context):
     self.layout.operator_context = 'INVOKE_DEFAULT' 
     self.layout.operator(OBJECT_OT_super_quick_align.bl_idname, icon='ALIGN_CENTER')
 
-# --- 2. CẬP NHẬT HÀM REGISTER/UNREGISTER ---
 def register():
     bpy.utils.register_class(OBJECT_OT_super_quick_align)
     bpy.types.VIEW3D_MT_object_context_menu.append(menu_func)
-    # Đăng ký Tool vào thanh bên trái
     bpy.utils.register_tool(VIEW3D_WST_super_align, separator=True)
 
 def unregister():
     bpy.utils.unregister_class(OBJECT_OT_super_quick_align)
     bpy.types.VIEW3D_MT_object_context_menu.remove(menu_func)
-    # Xóa Tool khỏi thanh bên trái
     bpy.utils.unregister_tool(VIEW3D_WST_super_align)
 
 if __name__ == "__main__":
