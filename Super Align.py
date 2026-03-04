@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Super Quick Align Pro",
     "author": "Bạn và AI",
-    "version": (2, 4, 0),
+    "version": (2, 5, 0),
     "blender": (4, 0, 0), 
-    "location": "View3D > Right Click Context Menu",
-    "description": "Absolute Snap (2 mặt) | Shift: Align | Alt: Distribute | Live Undo",
+    "location": "View3D > Toolbar (Phím T) hoặc Right Click Context Menu",
+    "description": "Tích hợp Toolbar | Absolute Snap | Align | Distribute | Live Undo",
     "warning": "",
     "doc_url": "",
     "category": "Object",
@@ -140,21 +140,12 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         if self.current_auto_mode == 'FACE':
             for i, obj in enumerate(all_objs): 
                 bbox_corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
-                
-                # Tính khoảng cách của 8 đỉnh tới mặt phẳng đích
                 distances = [(corner - self.snap_target).dot(self.snap_normal) for corner in bbox_corners]
-                
-                # Tính khoảng cách từ TRUNG TÂM vật thể tới mặt phẳng đích
                 center_pt = sum(bbox_corners, Vector()) / 8.0
                 center_dist = (center_pt - self.snap_target).dot(self.snap_normal)
                 
-                # --- LOGIC MỚI: BẮT ĐIỂM TỪ 2 HƯỚNG ÂM DƯƠNG ---
-                if center_dist >= 0:
-                    # Vật thể nằm ở bề mặt dương -> Lấy điểm gần mặt phẳng nhất (min)
-                    dist_to_move = min(distances)
-                else:
-                    # Vật thể nằm ở bề mặt âm -> Lấy điểm gần mặt phẳng nhất theo hướng ngược lại (max)
-                    dist_to_move = max(distances)
+                if center_dist >= 0: dist_to_move = min(distances)
+                else: dist_to_move = max(distances)
                     
                 target_objs[i].location -= (self.snap_normal * dist_to_move)
                 
@@ -578,18 +569,40 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             self.draw_handle_2d = None
         context.area.tag_redraw()
 
+# --- 1. LỚP ĐĂNG KÝ TOOL VÀO THANH TOOLBAR (PHÍM T) ---
+class VIEW3D_WST_super_align(bpy.types.WorkSpaceTool):
+    bl_space_type = 'VIEW_3D'
+    bl_context_mode = 'OBJECT'
+    
+    bl_idname = "tool.super_quick_align"
+    bl_label = "Super Align"
+    bl_description = "Công cụ thông minh: Align, Distribute, và Snap"
+    bl_icon = "ops.transform.translate" # Icon mũi tên di chuyển
+    
+    bl_widget = None
+    
+    # Gán thao tác chuột trái để kích hoạt lệnh Modal của chúng ta
+    bl_keymap = (
+        ("object.super_quick_align", {"type": 'LEFTMOUSE', "value": 'PRESS'}, None),
+    )
+
 def menu_func(self, context):
     self.layout.separator()
     self.layout.operator_context = 'INVOKE_DEFAULT' 
     self.layout.operator(OBJECT_OT_super_quick_align.bl_idname, icon='ALIGN_CENTER')
 
+# --- 2. CẬP NHẬT HÀM REGISTER/UNREGISTER ---
 def register():
     bpy.utils.register_class(OBJECT_OT_super_quick_align)
     bpy.types.VIEW3D_MT_object_context_menu.append(menu_func)
+    # Đăng ký Tool vào thanh bên trái
+    bpy.utils.register_tool(VIEW3D_WST_super_align, separator=True)
 
 def unregister():
     bpy.utils.unregister_class(OBJECT_OT_super_quick_align)
     bpy.types.VIEW3D_MT_object_context_menu.remove(menu_func)
+    # Xóa Tool khỏi thanh bên trái
+    bpy.utils.unregister_tool(VIEW3D_WST_super_align)
 
 if __name__ == "__main__":
     register()
