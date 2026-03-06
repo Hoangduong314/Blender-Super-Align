@@ -119,7 +119,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
     def get_dynamic_scale(self, context, origin_3d, desired_pixels=60.0):
         region = context.region
         rv3d = context.region_data
-        loc_2d = view3d_utils.matrix_world.translation_3d_to_region_2d(region, rv3d, origin_3d)
+        loc_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, origin_3d)
         if not loc_2d: 
             cam_dist = (origin_3d - rv3d.view_matrix.inverted().translation).length
             return cam_dist * 0.1
@@ -293,8 +293,14 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                     self.apply_exact_distance(context)
                     return {'RUNNING_MODAL'}
                 elif event.unicode.isdigit() or event.unicode in {'.', '-'}:
-                    self.input_distance += event.unicode
-                    self.apply_exact_distance(context)
+                    new_val = self.input_distance + event.unicode
+                    try:
+                        if new_val not in {'-', '.', '-.'}:
+                            float(new_val)
+                        self.input_distance = new_val
+                        self.apply_exact_distance(context)
+                    except ValueError:
+                        pass
                     return {'RUNNING_MODAL'}
 
             if event.type == 'MOUSEMOVE':
@@ -389,7 +395,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                     vec_dir = vec_edge / vec_len
                     proj_t = (proj_pt - v1).dot(vec_dir)
                     if 0 <= proj_t <= vec_len:
-                        proj_2d = view3d_utils.matrix_world.translation_3d_to_region_2d(region, rv3d, proj_pt)
+                        proj_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, proj_pt)
                         if proj_2d:
                             dist_2d = (mouse_vec_2d - proj_2d).length
                             if dist_2d < min_dist_2d:
@@ -493,8 +499,8 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             end_3d = origin_3d.copy()
             end_3d[i] = end_val
             
-            start_2d = view3d_utils.matrix_world.translation_3d_to_region_2d(region, rv3d, start_3d)
-            end_2d = view3d_utils.matrix_world.translation_3d_to_region_2d(region, rv3d, end_3d)
+            start_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, start_3d)
+            end_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, end_3d)
             if not start_2d or not end_2d: continue
             
             line_vec = end_2d - start_2d
@@ -696,7 +702,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 p2[axis_idx] = sorted_objs[i+1].matrix_world.translation[axis_idx]
                 
                 mid_pt = (p1 + p2) / 2.0
-                mid_2d = view3d_utils.matrix_world.translation_3d_to_region_2d(context.region, context.region_data, mid_pt)
+                mid_2d = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, mid_pt)
                 
                 if mid_2d:
                     dist = abs(p2[axis_idx] - p1[axis_idx])
