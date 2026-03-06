@@ -17,6 +17,9 @@ import os
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector, geometry
 from bpy_extras import view3d_utils
+import bpy.utils.previews
+
+custom_icons = None
 
 def get_shader():
     shader_names = ['UNLIT', 'POLYLINE_UNLIT_COLOR', '3D_UNLIT_COLOR', '3D_SMOOTH_COLOR', 'POLYLINE_SMOOTH_COLOR']
@@ -814,14 +817,30 @@ class VIEW3D_WST_super_align(bpy.types.WorkSpaceTool):
 def menu_func(self, context):
     self.layout.separator()
     self.layout.operator_context = 'INVOKE_DEFAULT' 
-    self.layout.operator(OBJECT_OT_super_quick_align.bl_idname, icon='ALIGN_CENTER')
+    icon_id = custom_icons["custom_icon"].icon_id if custom_icons and "custom_icon" in custom_icons else 0
+    if icon_id:
+        self.layout.operator(OBJECT_OT_super_quick_align.bl_idname, text="Super Align Pro", icon_value=icon_id)
+    else:
+        self.layout.operator(OBJECT_OT_super_quick_align.bl_idname, text="Super Align Pro", icon='ALIGN_CENTER')
 
 def register():
+    global custom_icons
+    custom_icons = bpy.utils.previews.new()
+    import os
+    icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
+    if os.path.exists(icon_path):
+        custom_icons.load("custom_icon", icon_path, 'IMAGE')
+
     bpy.utils.register_class(OBJECT_OT_super_quick_align)
     bpy.types.VIEW3D_MT_object_context_menu.append(menu_func)
     bpy.utils.register_tool(VIEW3D_WST_super_align, separator=True)
 
 def unregister():
+    global custom_icons
+    if custom_icons is not None:
+        bpy.utils.previews.remove(custom_icons)
+        custom_icons = None
+
     bpy.utils.unregister_class(OBJECT_OT_super_quick_align)
     bpy.types.VIEW3D_MT_object_context_menu.remove(menu_func)
     bpy.utils.unregister_tool(VIEW3D_WST_super_align)
