@@ -114,12 +114,12 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
     def get_selection_center(self):
         all_objs = self.selected_objs + [self.active_obj] if self.active_obj else []
         if not all_objs: return Vector((0, 0, 0))
-        return sum([obj.location for obj in all_objs], Vector()) / len(all_objs)
+        return sum([obj.matrix_world.translation for obj in all_objs], Vector()) / len(all_objs)
 
     def get_dynamic_scale(self, context, origin_3d, desired_pixels=60.0):
         region = context.region
         rv3d = context.region_data
-        loc_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, origin_3d)
+        loc_2d = view3d_utils.matrix_world.translation_3d_to_region_2d(region, rv3d, origin_3d)
         if not loc_2d: 
             cam_dist = (origin_3d - rv3d.view_matrix.inverted().translation).length
             return cam_dist * 0.1
@@ -155,7 +155,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             all_objs = self.selected_objs + [self.active_obj]
             if len(all_objs) >= 2:
                 axis_idx = self.hovered_axis
-                vals = [obj.location[axis_idx] for obj in all_objs]
+                vals = [obj.matrix_world.translation[axis_idx] for obj in all_objs]
                 min_val = min(vals)
                 max_val = max(vals)
                 step_internal = (max_val - min_val) / (len(all_objs) - 1)
@@ -190,7 +190,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 
                 if center_dist >= 0: dist_to_move = min(distances)
                 else: dist_to_move = max(distances)
-                target_objs[i].location -= (self.snap_normal * dist_to_move)
+                target_objs[i].matrix_world.translation -= (self.snap_normal * dist_to_move)
             bpy.ops.ed.undo_push(message="Copy & Stamp to Plane" if is_copy else "Absolute Snap to Plane")
         
         elif self.current_auto_mode == 'EDGE':
@@ -199,7 +199,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 center_pt = sum(bbox_corners, Vector((0,0,0))) / 8.0
                 vec_center_to_midpoint = self.snap_target - center_pt
                 translation_vec = vec_center_to_midpoint.dot(self.snap_edge_dir) * self.snap_edge_dir
-                target_objs[i].location += translation_vec
+                target_objs[i].matrix_world.translation += translation_vec
             bpy.ops.ed.undo_push(message="Copy & Slide to Edge" if is_copy else "Snap Objects to Edge")
 
     def update_mode_logic(self, context):
@@ -235,105 +235,114 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 self.find_snap_target(context)
 
     def modal(self, context, event):
-        context.area.tag_redraw()
-        
-        if context.active_object:
-            self.active_obj = context.active_object
-            self.selected_objs = [obj for obj in context.selected_objects if obj != self.active_obj]
-        else:
-            self.active_obj = None
-            self.selected_objs = []
+        try:
+            context.area.tag_redraw()
 
-        if event.type == 'Z' and event.value == 'PRESS' and (event.ctrl or event.oskey):
-            try:
-                if event.shift:
-                    bpy.ops.ed.redo()
-                    self.report({'INFO'}, "Redo: Bước tiếp theo")
-                else:
-                    bpy.ops.ed.undo()
-                    self.report({'INFO'}, "Undo: Đã lùi lại 1 bước")
-            except Exception as e: pass
-            
-            try:
-                self.active_obj = bpy.context.active_object
-                if self.active_obj:
-                    self.selected_objs = [obj for obj in bpy.context.selected_objects if obj != self.active_obj]
-                else:
-                    self.selected_objs = []
-            except ReferenceError: pass
-            return {'RUNNING_MODAL'}
+            if context.active_object:
+                self.active_obj = context.active_object
+                self.selected_objs = [obj for obj in context.selected_objects if obj != self.active_obj]
+            else:
+                self.active_obj = None
+                self.selected_objs = []
 
-        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
-            return {'PASS_THROUGH'}
-        
-        if event.type == 'RIGHTMOUSE' and event.value == 'RELEASE':
-            return {'RUNNING_MODAL'}
-            
-        if event.type in {'LEFT_SHIFT', 'RIGHT_SHIFT', 'LEFT_CTRL', 'RIGHT_CTRL'}:
-            self.is_shift_pressed = event.shift
-            self.is_ctrl_pressed = event.ctrl
-            self.update_mode_logic(context)
-            return {'RUNNING_MODAL'}
-            
-        if event.type == 'TAB':
-            if event.value == 'PRESS':
-                self.is_tab_pressed = True
-            elif event.value == 'RELEASE':
-                self.is_tab_pressed = False
-            self.update_mode_logic(context)
-            return {'RUNNING_MODAL'}
-            
-        if self.is_typing and event.value == 'PRESS':
-            if event.type in {'RET', 'NUMPAD_ENTER'}:
-                self.is_typing = False
-                return {'RUNNING_MODAL'}
-            elif event.type == 'BACK_SPACE':
-                self.input_distance = self.input_distance[:-1]
-                self.apply_exact_distance(context)
-                return {'RUNNING_MODAL'}
-            elif event.unicode.isdigit() or event.unicode in {'.', '-'}:
-                self.input_distance += event.unicode
-                self.apply_exact_distance(context)
+            if event.type == 'Z' and event.value == 'PRESS' and (event.ctrl or event.oskey):
+                try:
+                    if event.shift:
+                        bpy.ops.ed.redo()
+                        self.report({'INFO'}, "Redo: Bước tiếp theo")
+                    else:
+                        bpy.ops.ed.undo()
+                        self.report({'INFO'}, "Undo: Đã lùi lại 1 bước")
+                except Exception as e: pass
+
+                try:
+                    self.active_obj = bpy.context.active_object
+                    if self.active_obj:
+                        self.selected_objs = [obj for obj in bpy.context.selected_objects if obj != self.active_obj]
+                    else:
+                        self.selected_objs = []
+                except ReferenceError: pass
                 return {'RUNNING_MODAL'}
 
-        if event.type == 'MOUSEMOVE':
-            self.mouse_pos = (event.mouse_region_x, event.mouse_region_y)
-            self.update_mode_logic(context)
-            return {'RUNNING_MODAL'} 
+            if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
+                return {'PASS_THROUGH'}
 
-        if event.type in {'ESC'} and event.value == 'PRESS':
-            self.cleanup(context)
-            return {'CANCELLED'}
+            if event.type == 'RIGHTMOUSE' and event.value == 'RELEASE':
+                return {'RUNNING_MODAL'}
 
-        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-            if event.shift:
-                self.raycast_select(context, event)
+            if event.type in {'LEFT_SHIFT', 'RIGHT_SHIFT', 'LEFT_CTRL', 'RIGHT_CTRL'}:
+                self.is_shift_pressed = event.shift
+                self.is_ctrl_pressed = event.ctrl
                 self.update_mode_logic(context)
                 return {'RUNNING_MODAL'}
 
-            if self.tool_mode == 'SNAP':
-                if self.snap_target is not None:
-                    self.execute_snap(context, is_copy=event.ctrl) 
-                    return {'RUNNING_MODAL'}
-                        
-            elif self.tool_mode == 'DISTRIBUTE':
-                if self.hovered_axis is not None:
-                    if self.hovered_align_mode in {'MIN', 'MAX'}:
-                        if len(context.selected_objects) > 0:
-                            self.align_objects(self.hovered_axis, self.hovered_align_mode)
-                            bpy.ops.ed.undo_push(message=f"Align objects to {self.hovered_align_mode}")
-                    else:
-                        if len(context.selected_objects) > 1:
-                            self.distribute_objects_evenly(self.hovered_axis)
-                            self.distribute_axis = self.hovered_axis
-                            self.is_typing = True 
-                            self.input_distance = ""
-                            bpy.ops.ed.undo_push(message="Distribute evenly")
-                    return {'RUNNING_MODAL'}
-                    
-            return {'PASS_THROUGH'}
+            if event.type == 'TAB':
+                if event.value == 'PRESS':
+                    self.is_tab_pressed = True
+                elif event.value == 'RELEASE':
+                    self.is_tab_pressed = False
+                self.update_mode_logic(context)
+                return {'RUNNING_MODAL'}
 
-        return {'RUNNING_MODAL'} 
+            if self.is_typing and event.value == 'PRESS':
+                if event.type in {'RET', 'NUMPAD_ENTER'}:
+                    self.is_typing = False
+                    return {'RUNNING_MODAL'}
+                elif event.type == 'BACK_SPACE':
+                    self.input_distance = self.input_distance[:-1]
+                    self.apply_exact_distance(context)
+                    return {'RUNNING_MODAL'}
+                elif event.unicode.isdigit() or event.unicode in {'.', '-'}:
+                    self.input_distance += event.unicode
+                    self.apply_exact_distance(context)
+                    return {'RUNNING_MODAL'}
+
+            if event.type == 'MOUSEMOVE':
+                new_pos = (event.mouse_region_x, event.mouse_region_y)
+                if abs(new_pos[0] - self.mouse_pos[0]) > 2 or abs(new_pos[1] - self.mouse_pos[1]) > 2:
+                    self.mouse_pos = new_pos
+                    self.update_mode_logic(context)
+                return {'RUNNING_MODAL'} 
+
+            if event.type in {'ESC'} and event.value == 'PRESS':
+                self.cleanup(context)
+                return {'CANCELLED'}
+
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                if event.shift:
+                    self.raycast_select(context, event)
+                    self.update_mode_logic(context)
+                    return {'RUNNING_MODAL'}
+
+                if self.tool_mode == 'SNAP':
+                    if self.snap_target is not None:
+                        self.execute_snap(context, is_copy=event.ctrl) 
+                        return {'RUNNING_MODAL'}
+
+                elif self.tool_mode == 'DISTRIBUTE':
+                    if self.hovered_axis is not None:
+                        if self.hovered_align_mode in {'MIN', 'MAX'}:
+                            if len(context.selected_objects) > 0:
+                                self.align_objects(self.hovered_axis, self.hovered_align_mode)
+                                bpy.ops.ed.undo_push(message=f"Align objects to {self.hovered_align_mode}")
+                        else:
+                            if len(context.selected_objects) > 1:
+                                self.distribute_objects_evenly(self.hovered_axis)
+                                self.distribute_axis = self.hovered_axis
+                                self.is_typing = True 
+                                self.input_distance = ""
+                                bpy.ops.ed.undo_push(message="Distribute evenly")
+                        return {'RUNNING_MODAL'}
+
+                return {'PASS_THROUGH'}
+
+            return {'RUNNING_MODAL'} 
+
+
+        except Exception as e:
+            print(f"Super Align Fatal Error: {e}")
+            self.cleanup(context)
+            return {'CANCELLED'}
 
     def find_snap_target(self, context):
         region = context.region
@@ -380,7 +389,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                     vec_dir = vec_edge / vec_len
                     proj_t = (proj_pt - v1).dot(vec_dir)
                     if 0 <= proj_t <= vec_len:
-                        proj_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, proj_pt)
+                        proj_2d = view3d_utils.matrix_world.translation_3d_to_region_2d(region, rv3d, proj_pt)
                         if proj_2d:
                             dist_2d = (mouse_vec_2d - proj_2d).length
                             if dist_2d < min_dist_2d:
@@ -403,22 +412,26 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
     def align_objects(self, axis_index, mode):
         all_objs = self.selected_objs + [self.active_obj]
         if mode == 'MIN':
-            target_val = min([obj.location[axis_index] for obj in all_objs])
+            target_val = min([obj.matrix_world.translation[axis_index] for obj in all_objs])
         elif mode == 'MAX':
-            target_val = max([obj.location[axis_index] for obj in all_objs])
+            target_val = max([obj.matrix_world.translation[axis_index] for obj in all_objs])
             
         for obj in all_objs:
-            obj.location[axis_index] = target_val
+            loc = obj.matrix_world.translation.copy()
+            loc[axis_index] = target_val
+            obj.matrix_world.translation = loc
         bpy.context.view_layer.update()
 
     def distribute_objects_evenly(self, axis_index):
         all_objs = self.selected_objs + [self.active_obj]
-        all_objs.sort(key=lambda obj: obj.location[axis_index])
-        min_val = all_objs[0].location[axis_index]
-        max_val = all_objs[-1].location[axis_index]
+        all_objs.sort(key=lambda obj: obj.matrix_world.translation[axis_index])
+        min_val = all_objs[0].matrix_world.translation[axis_index]
+        max_val = all_objs[-1].matrix_world.translation[axis_index]
         step = (max_val - min_val) / (len(all_objs) - 1)
         for i, obj in enumerate(all_objs):
-            obj.location[axis_index] = min_val + (i * step)
+            loc = obj.matrix_world.translation.copy()
+            loc[axis_index] = min_val + (i * step)
+            obj.matrix_world.translation = loc
         bpy.context.view_layer.update()
 
     def apply_exact_distance(self, context):
@@ -430,14 +443,16 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         
         axis_index = self.distribute_axis
         all_objs = self.selected_objs + [self.active_obj]
-        all_objs.sort(key=lambda obj: obj.location[axis_index])
+        all_objs.sort(key=lambda obj: obj.matrix_world.translation[axis_index])
         
-        center_val = sum(obj.location[axis_index] for obj in all_objs) / len(all_objs)
+        center_val = sum(obj.matrix_world.translation[axis_index] for obj in all_objs) / len(all_objs)
         total_width = dist_internal * (len(all_objs) - 1)
         start_val = center_val - (total_width / 2.0)
         
         for i, obj in enumerate(all_objs):
-            obj.location[axis_index] = start_val + (i * dist_internal)
+            loc = obj.matrix_world.translation.copy()
+            loc[axis_index] = start_val + (i * dist_internal)
+            obj.matrix_world.translation = loc
             
         bpy.context.view_layer.update()
 
@@ -462,8 +477,8 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         
         for i, axis in enumerate(axes):
             # Tính giới hạn toạ độ theo trục
-            min_val = min(obj.location[i] for obj in all_objs)
-            max_val = max(obj.location[i] for obj in all_objs)
+            min_val = min(obj.matrix_world.translation[i] for obj in all_objs)
+            max_val = max(obj.matrix_world.translation[i] for obj in all_objs)
             
             # Đảm bảo trục không bị biến mất nếu các vật thể trùng nhau
             if max_val - min_val < margin_3d:
@@ -478,8 +493,8 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             end_3d = origin_3d.copy()
             end_3d[i] = end_val
             
-            start_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, start_3d)
-            end_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, end_3d)
+            start_2d = view3d_utils.matrix_world.translation_3d_to_region_2d(region, rv3d, start_3d)
+            end_2d = view3d_utils.matrix_world.translation_3d_to_region_2d(region, rv3d, end_3d)
             if not start_2d or not end_2d: continue
             
             line_vec = end_2d - start_2d
@@ -559,8 +574,8 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 
                 # Vẽ lại các đoạn trục co giãn theo toạ độ
                 for i in range(3):
-                    min_val = min(obj.location[i] for obj in all_objs)
-                    max_val = max(obj.location[i] for obj in all_objs)
+                    min_val = min(obj.matrix_world.translation[i] for obj in all_objs)
+                    max_val = max(obj.matrix_world.translation[i] for obj in all_objs)
                     
                     if max_val - min_val < margin_3d:
                         start_val = origin[i] - margin_3d
@@ -591,7 +606,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 if self.hovered_axis is not None and self.hovered_align_mode == 'CENTER' and len(all_objs) >= 2:
                     axis_idx = self.hovered_axis
                     axis_vec = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))][axis_idx]
-                    sorted_objs = sorted(all_objs, key=lambda obj: obj.location[axis_idx])
+                    sorted_objs = sorted(all_objs, key=lambda obj: obj.matrix_world.translation[axis_idx])
                     
                     rv3d = context.region_data
                     cam_vec = rv3d.view_matrix.inverted().col[2].xyz
@@ -605,9 +620,9 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                     
                     for i in range(len(sorted_objs) - 1):
                         p1 = origin.copy()
-                        p1[axis_idx] = sorted_objs[i].location[axis_idx]
+                        p1[axis_idx] = sorted_objs[i].matrix_world.translation[axis_idx]
                         p2 = origin.copy()
-                        p2[axis_idx] = sorted_objs[i+1].location[axis_idx]
+                        p2[axis_idx] = sorted_objs[i+1].matrix_world.translation[axis_idx]
                         
                         dim_lines.extend([p1, p2])
                         tick_lines.extend([p1 - tick_vec*tick_size, p1 + tick_vec*tick_size])
@@ -629,8 +644,8 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 # --- VẼ NGÔI SAO ALIGN Ở MIN/MAX TƯƠNG ỨNG MỚI ---
                 if self.hovered_axis is not None and self.hovered_align_mode in {'MIN', 'MAX'}:
                     axis_idx = self.hovered_axis
-                    min_val = min(obj.location[axis_idx] for obj in all_objs)
-                    max_val = max(obj.location[axis_idx] for obj in all_objs)
+                    min_val = min(obj.matrix_world.translation[axis_idx] for obj in all_objs)
+                    max_val = max(obj.matrix_world.translation[axis_idx] for obj in all_objs)
                     
                     if max_val - min_val < margin_3d:
                         start_val = origin[axis_idx] - margin_3d
@@ -670,18 +685,18 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         if self.tool_mode == 'DISTRIBUTE' and self.hovered_axis is not None and self.hovered_align_mode == 'CENTER' and len(all_objs) >= 2 and not self.is_shift_pressed:
             axis_idx = self.hovered_axis
             origin = self.get_selection_center()
-            sorted_objs = sorted(all_objs, key=lambda obj: obj.location[axis_idx])
+            sorted_objs = sorted(all_objs, key=lambda obj: obj.matrix_world.translation[axis_idx])
             multiplier = self.get_unit_multiplier(context)
             unit_sym = self.get_unit_symbol(context)
             
             for i in range(len(sorted_objs) - 1):
                 p1 = origin.copy()
-                p1[axis_idx] = sorted_objs[i].location[axis_idx]
+                p1[axis_idx] = sorted_objs[i].matrix_world.translation[axis_idx]
                 p2 = origin.copy()
-                p2[axis_idx] = sorted_objs[i+1].location[axis_idx]
+                p2[axis_idx] = sorted_objs[i+1].matrix_world.translation[axis_idx]
                 
                 mid_pt = (p1 + p2) / 2.0
-                mid_2d = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, mid_pt)
+                mid_2d = view3d_utils.matrix_world.translation_3d_to_region_2d(context.region, context.region_data, mid_pt)
                 
                 if mid_2d:
                     dist = abs(p2[axis_idx] - p1[axis_idx])
@@ -766,12 +781,14 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
 
     def cleanup(self, context):
         OBJECT_OT_super_quick_align._is_running = False
-        if self.draw_handle_3d:
-            bpy.types.SpaceView3D.draw_handler_remove(self.draw_handle_3d, 'WINDOW')
-            self.draw_handle_3d = None
-        if self.draw_handle_2d:
-            bpy.types.SpaceView3D.draw_handler_remove(self.draw_handle_2d, 'WINDOW')
-            self.draw_handle_2d = None
+        try:
+            if getattr(self, "draw_handle_3d", None):
+                bpy.types.SpaceView3D.draw_handler_remove(self.draw_handle_3d, 'WINDOW')
+                self.draw_handle_3d = None
+            if getattr(self, "draw_handle_2d", None):
+                bpy.types.SpaceView3D.draw_handler_remove(self.draw_handle_2d, 'WINDOW')
+                self.draw_handle_2d = None
+        except Exception: pass
         context.area.tag_redraw()
 
 class VIEW3D_WST_super_align(bpy.types.WorkSpaceTool):
