@@ -20,7 +20,6 @@ from bpy_extras import view3d_utils
 import bpy.utils.previews
 
 custom_icons = None
-addon_keymaps = []
 
 def get_shader():
     shader_names = ['UNLIT', 'POLYLINE_UNLIT_COLOR', '3D_UNLIT_COLOR', '3D_SMOOTH_COLOR', 'POLYLINE_SMOOTH_COLOR']
@@ -825,25 +824,8 @@ def register():
 
     bpy.utils.register_class(OBJECT_OT_super_quick_align)
     bpy.types.VIEW3D_MT_object_context_menu.append(menu_func)
-    
-    # Đăng ký phím tắt Ctrl + Shift + A cho Object Mode
-    wm = bpy.context.window_manager
-    kc = wm.keyconfigs.addon
-    if kc:
-        km = kc.keymaps.new(name='Object Mode', space_type='EMPTY')
-        kmi = km.keymap_items.new(OBJECT_OT_super_quick_align.bl_idname, 'A', 'PRESS', ctrl=True, shift=True)
-        addon_keymaps.append((km, kmi))
 
 def unregister():
-    global custom_icons
-    if custom_icons is not None:
-        bpy.utils.previews.remove(custom_icons)
-        custom_icons = None
-
-    for km, kmi in addon_keymaps:
-        km.keymap_items.remove(kmi)
-    addon_keymaps.clear()
-
     bpy.utils.unregister_class(OBJECT_OT_super_quick_align)
     bpy.types.VIEW3D_MT_object_context_menu.remove(menu_func)
 
