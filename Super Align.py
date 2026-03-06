@@ -20,6 +20,7 @@ from bpy_extras import view3d_utils
 import bpy.utils.previews
 
 custom_icons = None
+addon_keymaps = []
 
 def get_shader():
     shader_names = ['UNLIT', 'POLYLINE_UNLIT_COLOR', '3D_UNLIT_COLOR', '3D_SMOOTH_COLOR', 'POLYLINE_SMOOTH_COLOR']
@@ -296,14 +297,8 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                     self.apply_exact_distance(context)
                     return {'RUNNING_MODAL'}
                 elif event.unicode.isdigit() or event.unicode in {'.', '-'}:
-                    new_val = self.input_distance + event.unicode
-                    try:
-                        if new_val not in {'-', '.', '-.'}:
-                            float(new_val)
-                        self.input_distance = new_val
-                        self.apply_exact_distance(context)
-                    except ValueError:
-                        pass
+                    self.input_distance += event.unicode
+                    self.apply_exact_distance(context)
                     return {'RUNNING_MODAL'}
 
             if event.type == 'MOUSEMOVE':
@@ -800,20 +795,6 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         except Exception: pass
         context.area.tag_redraw()
 
-class VIEW3D_WST_super_align(bpy.types.WorkSpaceTool):
-    bl_space_type = 'VIEW_3D'
-    bl_context_mode = 'OBJECT'
-    
-    bl_idname = "tool.super_quick_align"
-    bl_label = "Super Align"
-    bl_description = "Công cụ thông minh tự động đoán ý định dựa trên số lượng vật thể"
-    bl_icon = "ops.transform.translate"
-    bl_widget = None
-    
-    bl_keymap = (
-        ("object.super_quick_align", {"type": 'LEFTMOUSE', "value": 'PRESS'}, None),
-    )
-
 def menu_func(self, context):
     self.layout.separator()
     self.layout.operator_context = 'INVOKE_DEFAULT' 
@@ -827,13 +808,31 @@ def register():
     global custom_icons
     custom_icons = bpy.utils.previews.new()
     import os
-    icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
+    
+    # Tìm file icon an toàn dựa vào context của Text Editor
+    try:
+        current_dir = os.path.dirname(__file__)
+    except NameError:
+        current_dir = r"g:\My Drive\Libraries\Blender\Blender-Super-Align"
+        for text in bpy.data.texts:
+            if text.name == "Super Align.py" and text.filepath:
+                current_dir = os.path.dirname(text.filepath)
+                break
+                
+    icon_path = os.path.join(current_dir, "icon.png")
     if os.path.exists(icon_path):
         custom_icons.load("custom_icon", icon_path, 'IMAGE')
 
     bpy.utils.register_class(OBJECT_OT_super_quick_align)
     bpy.types.VIEW3D_MT_object_context_menu.append(menu_func)
-    bpy.utils.register_tool(VIEW3D_WST_super_align, separator=True)
+    
+    # Đăng ký phím tắt Ctrl + Shift + A cho Object Mode
+    wm = bpy.context.window_manager
+    kc = wm.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name='Object Mode', space_type='EMPTY')
+        kmi = km.keymap_items.new(OBJECT_OT_super_quick_align.bl_idname, 'A', 'PRESS', ctrl=True, shift=True)
+        addon_keymaps.append((km, kmi))
 
 def unregister():
     global custom_icons
@@ -841,9 +840,12 @@ def unregister():
         bpy.utils.previews.remove(custom_icons)
         custom_icons = None
 
+    for km, kmi in addon_keymaps:
+        km.keymap_items.remove(kmi)
+    addon_keymaps.clear()
+
     bpy.utils.unregister_class(OBJECT_OT_super_quick_align)
     bpy.types.VIEW3D_MT_object_context_menu.remove(menu_func)
-    bpy.utils.unregister_tool(VIEW3D_WST_super_align)
 
 if __name__ == "__main__":
     register()
