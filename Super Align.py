@@ -178,7 +178,6 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         if is_copy:
             for obj in all_objs:
                 new_obj = obj.copy() 
-                if obj.data: new_obj.data = obj.data.copy() 
                 context.collection.objects.link(new_obj)
                 target_objs.append(new_obj)
         else:
@@ -194,7 +193,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 if center_dist >= 0: dist_to_move = min(distances)
                 else: dist_to_move = max(distances)
                 target_objs[i].matrix_world.translation -= (self.snap_normal * dist_to_move)
-            bpy.ops.ed.undo_push(message="Copy & Stamp to Plane" if is_copy else "Absolute Snap to Plane")
+            bpy.ops.ed.undo_push(message="Instance & Stamp to Plane" if is_copy else "Absolute Snap to Plane")
         
         elif self.current_auto_mode == 'EDGE':
             for i, obj in enumerate(all_objs):
@@ -203,7 +202,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 vec_center_to_midpoint = self.snap_target - center_pt
                 translation_vec = vec_center_to_midpoint.dot(self.snap_edge_dir) * self.snap_edge_dir
                 target_objs[i].matrix_world.translation += translation_vec
-            bpy.ops.ed.undo_push(message="Copy & Slide to Edge" if is_copy else "Snap Objects to Edge")
+            bpy.ops.ed.undo_push(message="Instance & Slide to Edge" if is_copy else "Snap Objects to Edge")
 
     def update_mode_logic(self, context):
         total_selected = len(context.selected_objects)
@@ -750,11 +749,11 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             if self.tool_mode == 'SNAP':
                 if self.current_auto_mode == 'FACE':
                     blf.color(font_id, 0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else blf.color(font_id, 0.0, 1.0, 1.0, 1.0)
-                    txt = "[COPY] Đóng dấu vật thể vào mặt" if self.is_ctrl_pressed else "Bắn vật thể chạm mặt (Tuyệt đối 2 chiều)"
+                    txt = "[INSTANCE] Face instance snap" if self.is_ctrl_pressed else "Snap object to face"
                     blf.draw(font_id, txt)
                 elif self.current_auto_mode == 'EDGE':
                     blf.color(font_id, 0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else blf.color(font_id, 1.0, 0.5, 0.0, 1.0)
-                    txt = "[COPY] Trượt copy dọc theo viền" if self.is_ctrl_pressed else "Trượt vật thể song song theo viền"
+                    txt = "[INSTANCE] Edge instance slide" if self.is_ctrl_pressed else "Slide object along edge"
                     blf.draw(font_id, txt)
                 else:
                     blf.color(font_id, 0.5, 0.5, 0.5, 1.0)
@@ -780,7 +779,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         if total_selected > 1 and not self.is_tab_pressed:
             blf.draw(font_id, "Tự động phân tích nhiều vật thể | [GIỮ TAB] Ép xài Snap | [SHIFT] Chọn thêm")
         else:
-            blf.draw(font_id, "Chỉ 1 vật thể: Snap | [CTRL] Copy Snap | [SHIFT] Click Chọn thêm vật thể")
+            blf.draw(font_id, "Chỉ 1 vật thể: Snap | [CTRL] Instance Snap | [SHIFT] Click Chọn thêm vật thể")
 
     def cleanup(self, context):
         OBJECT_OT_super_quick_align._is_running = False
