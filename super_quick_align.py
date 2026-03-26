@@ -1,25 +1,10 @@
-bl_info = {
-    "name": "Super Quick Align Pro",
-    "author": "Bạn và AI",
-    "version": (3, 2, 0),
-    "blender": (4, 0, 0), 
-    "location": "View3D > Toolbar (Phím T)",
-    "description": "Trục ảo tự co giãn theo vật thể | Thu hẹp vùng Hover 2 đầu mút",
-    "warning": "",
-    "doc_url": "",
-    "category": "Object",
-}
-
 import bpy
 import gpu
 import blf
-import os
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector, geometry
 from bpy_extras import view3d_utils
-import bpy.utils.previews
 
-custom_icons = None
 
 def get_shader():
     shader_names = ['UNLIT', 'POLYLINE_UNLIT_COLOR', '3D_UNLIT_COLOR', '3D_SMOOTH_COLOR', 'POLYLINE_SMOOTH_COLOR']
@@ -792,41 +777,3 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 self.draw_handle_2d = None
         except Exception: pass
         context.area.tag_redraw()
-
-def menu_func(self, context):
-    self.layout.separator()
-    self.layout.operator_context = 'INVOKE_DEFAULT' 
-    icon_id = custom_icons["custom_icon"].icon_id if custom_icons and "custom_icon" in custom_icons else 0
-    if icon_id:
-        self.layout.operator(OBJECT_OT_super_quick_align.bl_idname, text="Super Align Pro", icon_value=icon_id)
-    else:
-        self.layout.operator(OBJECT_OT_super_quick_align.bl_idname, text="Super Align Pro", icon='ALIGN_CENTER')
-
-def register():
-    global custom_icons
-    custom_icons = bpy.utils.previews.new()
-    import os
-    
-    # Tìm file icon an toàn dựa vào context của Text Editor
-    try:
-        current_dir = os.path.dirname(__file__)
-    except NameError:
-        current_dir = r"g:\My Drive\Libraries\Blender\Blender-Super-Align"
-        for text in bpy.data.texts:
-            if text.name == "Super Align.py" and text.filepath:
-                current_dir = os.path.dirname(text.filepath)
-                break
-                
-    icon_path = os.path.join(current_dir, "icon.png")
-    if os.path.exists(icon_path):
-        custom_icons.load("custom_icon", icon_path, 'IMAGE')
-
-    bpy.utils.register_class(OBJECT_OT_super_quick_align)
-    bpy.types.VIEW3D_MT_object_context_menu.append(menu_func)
-
-def unregister():
-    bpy.utils.unregister_class(OBJECT_OT_super_quick_align)
-    bpy.types.VIEW3D_MT_object_context_menu.remove(menu_func)
-
-if __name__ == "__main__":
-    register()

@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "super_quick_align"
+version = "3.2.0"
+name = "Super Quick Align Pro"
+tagline = "Quick snap, align, and distribute tools for the 3D View"
+maintainer = "Ban va AI"
+type = "add-on"
+
+tags = ["Object"]
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
