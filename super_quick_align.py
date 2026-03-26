@@ -2,7 +2,7 @@ import bpy
 import gpu
 import blf
 from gpu_extras.batch import batch_for_shader
-from mathutils import Vector, geometry
+from mathutils import Matrix, Vector, geometry
 from bpy_extras import view3d_utils
 
 
@@ -61,6 +61,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         self.is_ctrl_pressed = False 
         self.is_tab_pressed = False
         self.is_shift_pressed = False
+        self.is_alt_pressed = False
 
         self.draw_handle_3d = bpy.types.SpaceView3D.draw_handler_add(
             self.draw_3d, (context,), 'WINDOW', 'POST_VIEW'
@@ -69,9 +70,155 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             self.draw_2d, (context,), 'WINDOW', 'POST_PIXEL'
         )
         
+        self.update_mode_logic(context)
         context.window_manager.modal_handler_add(self)
         context.area.tag_redraw()
         return {'RUNNING_MODAL'}
+
+    def update_status_text(self, context):
+        total_selected = len(context.selected_objects)
+        parts = []
+
+        if self.is_shift_pressed:
+            parts.append("Selection mode")
+            parts.append("Click objects to add or remove them")
+        elif self.is_typing:
+            unit_sym = self.get_unit_symbol(context)
+            value = self.input_distance if self.input_distance else "0"
+            parts.append(f"Spacing: {value} {unit_sym}")
+            parts.append("Enter: confirm")
+            parts.append("Backspace: edit")
+        else:
+            if self.is_tab_pressed:
+                parts.append("Mode: Forced Smart Snap")
+            elif total_selected <= 1:
+                parts.append("Mode: Smart Snap")
+            else:
+                parts.append(f"Mode: Distribute ({total_selected} objects)")
+
+            if self.tool_mode == 'SNAP':
+                if self.is_alt_pressed:
+                    if self.current_auto_mode == 'FACE':
+                        parts.append("Click: copy and mirror across face plane" if self.is_ctrl_pressed else "Click: mirror across face plane")
+                    elif self.current_auto_mode == 'EDGE':
+                        parts.append("Click: copy and mirror across edge midpoint plane" if self.is_ctrl_pressed else "Click: mirror across edge midpoint plane")
+                    else:
+                        parts.append("Hover a face or edge to preview mirror plane")
+                    parts.append("Ctrl+Alt: copy and mirror")
+                else:
+                    if self.current_auto_mode == 'FACE':
+                        parts.append("Click: copy and snap to face" if self.is_ctrl_pressed else "Click: snap to face")
+                    elif self.current_auto_mode == 'EDGE':
+                        parts.append("Click: copy and slide along edge" if self.is_ctrl_pressed else "Click: slide along edge")
+                    else:
+                        parts.append("Hover a face or edge to preview snapping")
+                    parts.append("Ctrl: copy")
+                parts.append("Alt: mirror")
+                parts.append("Shift: selection")
+            else:
+                if self.hovered_axis is not None:
+                    if self.hovered_align_mode in {'MIN', 'MAX'}:
+                        edge_name = 'MIN' if self.hovered_align_mode == 'MIN' else 'MAX'
+                        parts.append(f"Click: align all objects to {edge_name}")
+                    else:
+                        parts.append("Click axis center: distribute evenly")
+                        parts.append("Type 0: collapse to center")
+                else:
+                    parts.append("Hover an axis: middle distributes, ends align")
+                parts.append("Tab: force Smart Snap")
+                parts.append("Shift: selection")
+
+        try:
+            context.workspace.status_text_set(" | ".join(parts))
+        except Exception:
+            pass
+    def mirror_matrix_across_plane(self, matrix_world, plane_point, plane_normal):
+        normal = plane_normal.normalized()
+        nx, ny, nz = normal
+        reflection = Matrix((
+            (1.0 - 2.0 * nx * nx, -2.0 * nx * ny, -2.0 * nx * nz, 0.0),
+            (-2.0 * ny * nx, 1.0 - 2.0 * ny * ny, -2.0 * ny * nz, 0.0),
+            (-2.0 * nz * nx, -2.0 * nz * ny, 1.0 - 2.0 * nz * nz, 0.0),
+            (0.0, 0.0, 0.0, 1.0),
+        ))
+        return Matrix.Translation(plane_point) @ reflection @ Matrix.Translation(-plane_point) @ matrix_world
+
+    def get_snap_preview_matrices(self):
+        all_objs = self.selected_objs + [self.active_obj]
+        preview_items = []
+
+        if not all_objs or self.snap_target is None:
+            return preview_items
+
+        for obj in all_objs:
+            preview_matrix = obj.matrix_world.copy()
+
+            if self.is_alt_pressed:
+                if self.current_auto_mode == 'FACE':
+                    preview_matrix = self.mirror_matrix_across_plane(preview_matrix, self.snap_target, self.snap_normal)
+                elif self.current_auto_mode == 'EDGE':
+                    preview_matrix = self.mirror_matrix_across_plane(preview_matrix, self.snap_target, self.snap_edge_dir)
+                else:
+                    continue
+            elif self.current_auto_mode == 'FACE':
+                bbox_corners = [preview_matrix @ Vector(corner) for corner in obj.bound_box]
+                distances = [(corner - self.snap_target).dot(self.snap_normal) for corner in bbox_corners]
+                center_pt = sum(bbox_corners, Vector()) / 8.0
+                center_dist = (center_pt - self.snap_target).dot(self.snap_normal)
+                dist_to_move = min(distances) if center_dist >= 0 else max(distances)
+                preview_matrix.translation -= self.snap_normal * dist_to_move
+            elif self.current_auto_mode == 'EDGE':
+                bbox_corners = [preview_matrix @ Vector(corner) for corner in obj.bound_box]
+                center_pt = sum(bbox_corners, Vector((0, 0, 0))) / 8.0
+                vec_center_to_midpoint = self.snap_target - center_pt
+                translation_vec = vec_center_to_midpoint.dot(self.snap_edge_dir) * self.snap_edge_dir
+                preview_matrix.translation += translation_vec
+            else:
+                continue
+
+            preview_items.append((obj, preview_matrix))
+
+        return preview_items
+
+    def draw_preview_bboxes(self, shader, preview_items):
+        if not preview_items:
+            return
+
+        bbox_edge_indices = (
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        )
+        line_coords = []
+
+        if self.is_alt_pressed and self.is_ctrl_pressed:
+            line_color = (0.45, 1.0, 0.45, 0.95)
+        elif self.is_alt_pressed:
+            line_color = (1.0, 0.65, 0.25, 0.95)
+        elif self.is_ctrl_pressed:
+            line_color = (0.25, 1.0, 0.45, 0.95)
+        else:
+            line_color = (0.25, 1.0, 1.0, 0.9)
+
+        for obj, preview_matrix in preview_items:
+            if obj == self.active_obj and obj.type == 'MESH' and getattr(obj.data, 'edges', None):
+                verts = obj.data.vertices
+                for edge in obj.data.edges:
+                    line_coords.extend([
+                        preview_matrix @ verts[edge.vertices[0]].co,
+                        preview_matrix @ verts[edge.vertices[1]].co,
+                    ])
+            else:
+                corners = [preview_matrix @ Vector(corner) for corner in obj.bound_box]
+                for start_idx, end_idx in bbox_edge_indices:
+                    line_coords.extend([corners[start_idx], corners[end_idx]])
+
+        batch_lines = batch_for_shader(shader, 'LINES', {"pos": line_coords, "color": [line_color] * len(line_coords)})
+        try:
+            gpu.state.line_width_set(2.0)
+        except:
+            pass
+        batch_lines.draw(shader)
 
     def get_unit_multiplier(self, context):
         unit_settings = context.scene.unit_settings
@@ -94,7 +241,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         if unit_settings.system == 'NONE': return "Units"
         symbols = {
             'KILOMETERS': 'km', 'METERS': 'm', 'CENTIMETERS': 'cm', 
-            'MILLIMETERS': 'mm', 'MICROMETERS': 'µm', 'MILES': 'mi', 
+            'MILLIMETERS': 'mm', 'MICROMETERS': 'Ã‚Âµm', 'MILES': 'mi', 
             'FEET': 'ft', 'INCHES': 'in', 'THOU': 'thou'
         }
         return symbols.get(unit_settings.length_unit, 'm')
@@ -157,7 +304,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         else:
             self.current_preview_distance_str = ""
 
-    def execute_snap(self, context, is_copy):
+    def execute_snap(self, context, is_copy, is_mirror=False):
         all_objs = self.selected_objs + [self.active_obj]
         target_objs = []
         if is_copy:
@@ -168,7 +315,26 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         else:
             target_objs = all_objs 
         
-        if self.current_auto_mode == 'FACE':
+        if is_mirror:
+            if self.current_auto_mode == 'FACE':
+                plane_point = self.snap_target
+                plane_normal = self.snap_normal
+                undo_message = "Copy & Mirror Across Face" if is_copy else "Mirror Across Face"
+            elif self.current_auto_mode == 'EDGE':
+                plane_point = self.snap_target
+                plane_normal = self.snap_edge_dir
+                undo_message = "Copy & Mirror Across Edge Midpoint Plane" if is_copy else "Mirror Across Edge Midpoint Plane"
+            else:
+                plane_point = None
+                plane_normal = None
+                undo_message = None
+
+            if plane_point is not None and plane_normal is not None:
+                for obj in target_objs:
+                    obj.matrix_world = self.mirror_matrix_across_plane(obj.matrix_world.copy(), plane_point, plane_normal)
+                bpy.ops.ed.undo_push(message=undo_message)
+
+        elif self.current_auto_mode == 'FACE':
             for i, obj in enumerate(all_objs): 
                 bbox_corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
                 distances = [(corner - self.snap_target).dot(self.snap_normal) for corner in bbox_corners]
@@ -188,6 +354,20 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 translation_vec = vec_center_to_midpoint.dot(self.snap_edge_dir) * self.snap_edge_dir
                 target_objs[i].matrix_world.translation += translation_vec
             bpy.ops.ed.undo_push(message="Instance & Slide to Edge" if is_copy else "Snap Objects to Edge")
+
+        if is_copy and target_objs:
+            for obj in context.selected_objects:
+                obj.select_set(False)
+
+            for obj in target_objs:
+                obj.select_set(True)
+
+            new_active = target_objs[-1] if self.active_obj else target_objs[0]
+            context.view_layer.objects.active = new_active
+            self.active_obj = new_active
+            self.selected_objs = [obj for obj in target_objs if obj != new_active]
+
+        self.update_status_text(context)
 
     def update_mode_logic(self, context):
         total_selected = len(context.selected_objects)
@@ -220,6 +400,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 self.hovered_axis = None
                 self.current_preview_distance_str = ""
                 self.find_snap_target(context)
+        self.update_status_text(context)
 
     def modal(self, context, event):
         try:
@@ -236,10 +417,10 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 try:
                     if event.shift:
                         bpy.ops.ed.redo()
-                        self.report({'INFO'}, "Redo: Bước tiếp theo")
+                        self.report({'INFO'}, "Redo: BÃ†Â°Ã¡Â»â€ºc tiÃ¡ÂºÂ¿p theo")
                     else:
                         bpy.ops.ed.undo()
-                        self.report({'INFO'}, "Undo: Đã lùi lại 1 bước")
+                        self.report({'INFO'}, "Undo: Ã„ÂÃƒÂ£ lÃƒÂ¹i lÃ¡ÂºÂ¡i 1 bÃ†Â°Ã¡Â»â€ºc")
                 except Exception as e: pass
 
                 try:
@@ -257,9 +438,10 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             if event.type == 'RIGHTMOUSE' and event.value == 'RELEASE':
                 return {'RUNNING_MODAL'}
 
-            if event.type in {'LEFT_SHIFT', 'RIGHT_SHIFT', 'LEFT_CTRL', 'RIGHT_CTRL'}:
+            if event.type in {'LEFT_SHIFT', 'RIGHT_SHIFT', 'LEFT_CTRL', 'RIGHT_CTRL', 'LEFT_ALT', 'RIGHT_ALT'}:
                 self.is_shift_pressed = event.shift
                 self.is_ctrl_pressed = event.ctrl
+                self.is_alt_pressed = event.alt
                 self.update_mode_logic(context)
                 return {'RUNNING_MODAL'}
 
@@ -274,14 +456,17 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             if self.is_typing and event.value == 'PRESS':
                 if event.type in {'RET', 'NUMPAD_ENTER'}:
                     self.is_typing = False
+                    self.update_status_text(context)
                     return {'RUNNING_MODAL'}
                 elif event.type == 'BACK_SPACE':
                     self.input_distance = self.input_distance[:-1]
                     self.apply_exact_distance(context)
+                    self.update_status_text(context)
                     return {'RUNNING_MODAL'}
                 elif event.unicode.isdigit() or event.unicode in {'.', '-'}:
                     self.input_distance += event.unicode
                     self.apply_exact_distance(context)
+                    self.update_status_text(context)
                     return {'RUNNING_MODAL'}
 
             if event.type == 'MOUSEMOVE':
@@ -303,7 +488,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
 
                 if self.tool_mode == 'SNAP':
                     if self.snap_target is not None:
-                        self.execute_snap(context, is_copy=event.ctrl) 
+                        self.execute_snap(context, is_copy=event.ctrl, is_mirror=event.alt) 
                         return {'RUNNING_MODAL'}
 
                 elif self.tool_mode == 'DISTRIBUTE':
@@ -443,7 +628,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             
         bpy.context.view_layer.update()
 
-    # --- THUẬT TOÁN MỚI: TÍNH TOÁN CHIỀU DÀI TRỤC THEO BOUNDING VÀ VÙNG HOVER CỐ ĐỊNH ---
+    # --- THUÃ¡ÂºÂ¬T TOÃƒÂN MÃ¡Â»Å¡I: TÃƒÂNH TOÃƒÂN CHIÃ¡Â»â‚¬U DÃƒâ‚¬I TRÃ¡Â»Â¤C THEO BOUNDING VÃƒâ‚¬ VÃƒâ„¢NG HOVER CÃ¡Â»Â Ã„ÂÃ¡Â»Å NH ---
     def get_hovered_axis(self, context):
         if not getattr(self, "active_obj", None): return None, 'CENTER'
         
@@ -451,7 +636,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         rv3d = context.region_data
         origin_3d = self.get_selection_center()
         
-        # Thêm lề (margin) 40 pixels không gian màn hình vào đuôi trục ảo
+        # ThÃƒÂªm lÃ¡Â»Â (margin) 40 pixels khÃƒÂ´ng gian mÃƒÂ n hÃƒÂ¬nh vÃƒÂ o Ã„â€˜uÃƒÂ´i trÃ¡Â»Â¥c Ã¡ÂºÂ£o
         margin_3d = self.get_dynamic_scale(context, origin_3d, 40.0) 
         mouse_vec = Vector((self.mouse_pos[0], self.mouse_pos[1]))
         
@@ -463,11 +648,11 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
         all_objs = self.selected_objs + [self.active_obj]
         
         for i, axis in enumerate(axes):
-            # Tính giới hạn toạ độ theo trục
+            # TÃƒÂ­nh giÃ¡Â»â€ºi hÃ¡ÂºÂ¡n toÃ¡ÂºÂ¡ Ã„â€˜Ã¡Â»â„¢ theo trÃ¡Â»Â¥c
             min_val = min(obj.matrix_world.translation[i] for obj in all_objs)
             max_val = max(obj.matrix_world.translation[i] for obj in all_objs)
             
-            # Đảm bảo trục không bị biến mất nếu các vật thể trùng nhau
+            # Ã„ÂÃ¡ÂºÂ£m bÃ¡ÂºÂ£o trÃ¡Â»Â¥c khÃƒÂ´ng bÃ¡Â»â€¹ biÃ¡ÂºÂ¿n mÃ¡ÂºÂ¥t nÃ¡ÂºÂ¿u cÃƒÂ¡c vÃ¡ÂºÂ­t thÃ¡Â»Æ’ trÃƒÂ¹ng nhau
             if max_val - min_val < margin_3d:
                 start_val = origin_3d[i] - margin_3d
                 end_val = origin_3d[i] + margin_3d
@@ -498,15 +683,15 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                     min_dist = dist
                     best_axis = i
                     
-                    # Giới hạn độ lớn vùng Hover cố định 30 pixels ở 2 mút
+                    # GiÃ¡Â»â€ºi hÃ¡ÂºÂ¡n Ã„â€˜Ã¡Â»â„¢ lÃ¡Â»â€ºn vÃƒÂ¹ng Hover cÃ¡Â»â€˜ Ã„â€˜Ã¡Â»â€¹nh 30 pixels Ã¡Â»Å¸ 2 mÃƒÂºt
                     hover_zone_px = 30.0 
                     
-                    # Nếu trục trên màn hình quá ngắn, chia tỷ lệ 15% / 70% / 15%
+                    # NÃ¡ÂºÂ¿u trÃ¡Â»Â¥c trÃƒÂªn mÃƒÂ n hÃƒÂ¬nh quÃƒÂ¡ ngÃ¡ÂºÂ¯n, chia tÃ¡Â»Â· lÃ¡Â»â€¡ 15% / 70% / 15%
                     if line_len < hover_zone_px * 2.5:
                         if proj < line_len * 0.15: best_mode = 'MIN'
                         elif proj > line_len * 0.85: best_mode = 'MAX'
                         else: best_mode = 'CENTER'
-                    # Nếu trục đủ dài, khóa chết 30 pixels ở mép
+                    # NÃ¡ÂºÂ¿u trÃ¡Â»Â¥c Ã„â€˜Ã¡Â»Â§ dÃƒÂ i, khÃƒÂ³a chÃ¡ÂºÂ¿t 30 pixels Ã¡Â»Å¸ mÃƒÂ©p
                     else:
                         if proj < hover_zone_px: best_mode = 'MIN'
                         elif proj > line_len - hover_zone_px: best_mode = 'MAX'
@@ -536,17 +721,61 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                     shader.bind()
                     batch_lines.draw(shader)
                     
-                    if self.current_auto_mode == 'EDGE':
-                        s = self.get_dynamic_scale(context, self.snap_target, 15.0) 
-                        cross_verts = [
-                            self.snap_target - Vector((s,0,0)), self.snap_target + Vector((s,0,0)),
-                            self.snap_target - Vector((0,s,0)), self.snap_target + Vector((0,s,0)),
-                            self.snap_target - Vector((0,0,s)), self.snap_target + Vector((0,0,s))
+                    if self.is_alt_pressed:
+                        plane_normal = self.snap_normal if self.current_auto_mode == 'FACE' else self.snap_edge_dir
+                        plane_normal = plane_normal.normalized()
+                        ref_axis = Vector((0, 0, 1)) if abs(plane_normal.dot(Vector((0, 0, 1)))) < 0.9 else Vector((0, 1, 0))
+                        plane_u = plane_normal.cross(ref_axis).normalized()
+                        plane_v = plane_normal.cross(plane_u).normalized()
+                        s = self.get_dynamic_scale(context, self.snap_target, 16.0)
+                        plane_corners = [
+                            self.snap_target + (-plane_u - plane_v) * s,
+                            self.snap_target + (plane_u - plane_v) * s,
+                            self.snap_target + (plane_u + plane_v) * s,
+                            self.snap_target + (-plane_u + plane_v) * s,
                         ]
-                        cross_colors = [(1.0, 1.0, 0.0, 1.0)] * 6
-                        batch_cross = batch_for_shader(shader, 'LINES', {"pos": cross_verts, "color": cross_colors})
-                        batch_cross.draw(shader)
-                        
+                        plane_fill = [plane_corners[0], plane_corners[1], plane_corners[2], plane_corners[0], plane_corners[2], plane_corners[3]]
+                        plane_outline = [
+                            plane_corners[0], plane_corners[1],
+                            plane_corners[1], plane_corners[2],
+                            plane_corners[2], plane_corners[3],
+                            plane_corners[3], plane_corners[0],
+                        ]
+                        batch_plane_fill = batch_for_shader(shader, 'TRIS', {"pos": plane_fill, "color": [(1.0, 0.45, 0.15, 0.18)] * len(plane_fill)})
+                        batch_plane_outline = batch_for_shader(shader, 'LINES', {"pos": plane_outline, "color": [(1.0, 0.7, 0.25, 1.0)] * len(plane_outline)})
+                        batch_plane_fill.draw(shader)
+                        try: gpu.state.line_width_set(2.0)
+                        except: pass
+                        batch_plane_outline.draw(shader)
+                    elif self.current_auto_mode == 'EDGE':
+                        plane_normal = self.snap_edge_dir.normalized()
+                        ref_axis = Vector((0, 0, 1)) if abs(plane_normal.dot(Vector((0, 0, 1)))) < 0.9 else Vector((0, 1, 0))
+                        plane_u = plane_normal.cross(ref_axis).normalized()
+                        plane_v = plane_normal.cross(plane_u).normalized()
+                        s = self.get_dynamic_scale(context, self.snap_target, 12.0)
+                        plane_corners = [
+                            self.snap_target + (-plane_u - plane_v) * s,
+                            self.snap_target + (plane_u - plane_v) * s,
+                            self.snap_target + (plane_u + plane_v) * s,
+                            self.snap_target + (-plane_u + plane_v) * s,
+                        ]
+                        plane_fill = [plane_corners[0], plane_corners[1], plane_corners[2], plane_corners[0], plane_corners[2], plane_corners[3]]
+                        plane_outline = [
+                            plane_corners[0], plane_corners[1],
+                            plane_corners[1], plane_corners[2],
+                            plane_corners[2], plane_corners[3],
+                            plane_corners[3], plane_corners[0],
+                        ]
+                        batch_plane_fill = batch_for_shader(shader, 'TRIS', {"pos": plane_fill, "color": [(1.0, 0.95, 0.25, 0.18)] * len(plane_fill)})
+                        batch_plane_outline = batch_for_shader(shader, 'LINES', {"pos": plane_outline, "color": [(1.0, 1.0, 0.35, 1.0)] * len(plane_outline)})
+                        batch_plane_fill.draw(shader)
+                        try: gpu.state.line_width_set(2.0)
+                        except: pass
+                        batch_plane_outline.draw(shader)
+
+                    preview_items = self.get_snap_preview_matrices()
+                    self.draw_preview_bboxes(shader, preview_items)
+                    
                     gpu.state.blend_set('NONE')
                     gpu.state.depth_test_set('LESS_EQUAL')
                 return
@@ -559,7 +788,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 base_colors = [(1.0, 0.2, 0.2), (0.2, 1.0, 0.2), (0.2, 0.5, 1.0)]
                 colors = []
                 
-                # Vẽ lại các đoạn trục co giãn theo toạ độ
+                # VÃ¡ÂºÂ½ lÃ¡ÂºÂ¡i cÃƒÂ¡c Ã„â€˜oÃ¡ÂºÂ¡n trÃ¡Â»Â¥c co giÃƒÂ£n theo toÃ¡ÂºÂ¡ Ã„â€˜Ã¡Â»â„¢
                 for i in range(3):
                     min_val = min(obj.matrix_world.translation[i] for obj in all_objs)
                     max_val = max(obj.matrix_world.translation[i] for obj in all_objs)
@@ -589,7 +818,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                 shader.bind()
                 batch.draw(shader)
                 
-                # --- VẼ DIMENSION LINES ---
+                # --- VÃ¡ÂºÂ¼ DIMENSION LINES ---
                 if self.hovered_axis is not None and self.hovered_align_mode == 'CENTER' and len(all_objs) >= 2:
                     axis_idx = self.hovered_axis
                     axis_vec = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))][axis_idx]
@@ -628,7 +857,7 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                         except: pass
                         batch_tick.draw(shader)
 
-                # --- VẼ NGÔI SAO ALIGN Ở MIN/MAX TƯƠNG ỨNG MỚI ---
+                # --- VÃ¡ÂºÂ¼ NGÃƒâ€I SAO ALIGN Ã¡Â»Å¾ MIN/MAX TÃ†Â¯Ã†Â NG Ã¡Â»Â¨NG MÃ¡Â»Å¡I ---
                 if self.hovered_axis is not None and self.hovered_align_mode in {'MIN', 'MAX'}:
                     axis_idx = self.hovered_axis
                     min_val = min(obj.matrix_world.translation[axis_idx] for obj in all_objs)
@@ -647,17 +876,34 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                     else:
                         point_3d[axis_idx] = end_val
                         
-                    s = self.get_dynamic_scale(context, point_3d, 12.0) 
-                    pt_verts = [
-                        point_3d - Vector((s,0,0)), point_3d + Vector((s,0,0)),
-                        point_3d - Vector((0,s,0)), point_3d + Vector((0,s,0)),
-                        point_3d - Vector((0,0,s)), point_3d + Vector((0,0,s))
+                    s = self.get_dynamic_scale(context, point_3d, 10.0)
+                    plane_axes = [
+                        (Vector((0, 1, 0)), Vector((0, 0, 1))),
+                        (Vector((1, 0, 0)), Vector((0, 0, 1))),
+                        (Vector((1, 0, 0)), Vector((0, 1, 0))),
                     ]
-                    pt_colors = [(1.0, 1.0, 0.0, 1.0)] * 6 
-                    batch_pt = batch_for_shader(shader, 'LINES', {"pos": pt_verts, "color": pt_colors})
-                    try: gpu.state.line_width_set(8.0) 
+                    plane_u, plane_v = plane_axes[axis_idx]
+                    corners = [
+                        point_3d + (-plane_u - plane_v) * s,
+                        point_3d + (plane_u - plane_v) * s,
+                        point_3d + (plane_u + plane_v) * s,
+                        point_3d + (-plane_u + plane_v) * s,
+                    ]
+                    plane_fill = [corners[0], corners[1], corners[2], corners[0], corners[2], corners[3]]
+                    plane_outline = [
+                        corners[0], corners[1],
+                        corners[1], corners[2],
+                        corners[2], corners[3],
+                        corners[3], corners[0],
+                    ]
+                    fill_color = [(1.0, 0.9, 0.2, 0.18)] * len(plane_fill)
+                    outline_color = [(1.0, 0.95, 0.35, 0.95)] * len(plane_outline)
+                    batch_plane_fill = batch_for_shader(shader, 'TRIS', {"pos": plane_fill, "color": fill_color})
+                    batch_plane_outline = batch_for_shader(shader, 'LINES', {"pos": plane_outline, "color": outline_color})
+                    batch_plane_fill.draw(shader)
+                    try: gpu.state.line_width_set(2.5)
                     except: pass
-                    batch_pt.draw(shader)
+                    batch_plane_outline.draw(shader)
 
                 gpu.state.blend_set('NONE')
                 gpu.state.depth_test_set('LESS_EQUAL')
@@ -699,73 +945,6 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
                     blf.draw(font_id, dist_str)
                     blf.disable(font_id, blf.SHADOW)
 
-        if self.is_typing:
-            blf.position(font_id, 30, 110, 0)
-            blf.size(font_id, 24)
-            blf.color(font_id, 0.0, 1.0, 0.0, 1.0)
-            unit_sym = self.get_unit_symbol(context)
-            blf.draw(font_id, f"Giãn cách: {self.input_distance} {unit_sym} (Nhấn Enter để chốt)")
-            
-        blf.position(font_id, 30, 80, 0)
-        blf.size(font_id, 26)
-        
-        total_selected = len(context.selected_objects)
-        
-        if self.is_shift_pressed:
-            blf.color(font_id, 1.0, 1.0, 1.0, 1.0) 
-            blf.draw(font_id, "[CHẾ ĐỘ: CHỌN VẬT THỂ]")
-        elif self.is_tab_pressed:
-            blf.color(font_id, 1.0, 0.5, 0.0, 1.0) 
-            blf.draw(font_id, "[ÉP CHẾ ĐỘ: SMART SNAP]")
-        elif total_selected <= 1:
-            blf.color(font_id, 0.0, 1.0, 0.8, 1.0) 
-            blf.draw(font_id, "[CHẾ ĐỘ: SMART SNAP (1 Vật thể)]")
-        else:
-            blf.color(font_id, 0.0, 0.8, 1.0, 1.0) 
-            blf.draw(font_id, f"[CHẾ ĐỘ: DISTRIBUTE ({total_selected} Vật thể)]")
-            
-        blf.position(font_id, 30, 50, 0)
-        blf.size(font_id, 18)
-        
-        if self.is_shift_pressed:
-            blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
-            blf.draw(font_id, "Click vào các vật thể khác để chọn thêm hoặc loại bỏ...")
-        else:
-            if self.tool_mode == 'SNAP':
-                if self.current_auto_mode == 'FACE':
-                    blf.color(font_id, 0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else blf.color(font_id, 0.0, 1.0, 1.0, 1.0)
-                    txt = "[INSTANCE] Face instance snap" if self.is_ctrl_pressed else "Snap object to face"
-                    blf.draw(font_id, txt)
-                elif self.current_auto_mode == 'EDGE':
-                    blf.color(font_id, 0.0, 1.0, 0.0, 1.0) if self.is_ctrl_pressed else blf.color(font_id, 1.0, 0.5, 0.0, 1.0)
-                    txt = "[INSTANCE] Edge instance slide" if self.is_ctrl_pressed else "Slide object along edge"
-                    blf.draw(font_id, txt)
-                else:
-                    blf.color(font_id, 0.5, 0.5, 0.5, 1.0)
-                    blf.draw(font_id, "Rê chuột lên bề mặt hoặc mép cạnh để bắt điểm...")
-                        
-            elif self.tool_mode == 'DISTRIBUTE':
-                if self.hovered_axis is not None:
-                    if self.hovered_align_mode in {'MIN', 'MAX'}:
-                        m_str = "MIN (-)" if self.hovered_align_mode == 'MIN' else "MAX (+)"
-                        blf.color(font_id, 1.0, 0.8, 0.0, 1.0)
-                        blf.draw(font_id, f"Click để Dồn toàn bộ {total_selected} vật thể về {m_str}")
-                    else:
-                        blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
-                        blf.draw(font_id, "Click giữa trục để Giãn đều. Nhập '0' để Gom vào tâm!")
-                else:
-                    blf.color(font_id, 0.7, 0.7, 0.7, 1.0)
-                    blf.draw(font_id, "Rê chuột vào Trục: Khúc giữa -> Giãn | Hai đầu (30px) -> Dồn (Align)")
-
-        blf.position(font_id, 30, 25, 0)
-        blf.size(font_id, 14)
-        blf.color(font_id, 0.8, 0.8, 0.8, 1.0)
-        
-        if total_selected > 1 and not self.is_tab_pressed:
-            blf.draw(font_id, "Tự động phân tích nhiều vật thể | [GIỮ TAB] Ép xài Snap | [SHIFT] Chọn thêm")
-        else:
-            blf.draw(font_id, "Chỉ 1 vật thể: Snap | [CTRL] Instance Snap | [SHIFT] Click Chọn thêm vật thể")
-
     def cleanup(self, context):
         OBJECT_OT_super_quick_align._is_running = False
         try:
@@ -775,5 +954,10 @@ class OBJECT_OT_super_quick_align(bpy.types.Operator):
             if getattr(self, "draw_handle_2d", None):
                 bpy.types.SpaceView3D.draw_handler_remove(self.draw_handle_2d, 'WINDOW')
                 self.draw_handle_2d = None
-        except Exception: pass
+        except Exception:
+            pass
+        try:
+            context.workspace.status_text_set(None)
+        except Exception:
+            pass
         context.area.tag_redraw()
